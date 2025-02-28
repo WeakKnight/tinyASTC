@@ -1,16 +1,14 @@
-static const bool kUseAdam = true;
-static const int kNumOptimizationSteps = 16;
-
-static const float lr = 0.0155;
-static const float adamBeta1 = 0.78;
-static const float adamBeta2 = 0.999;
-
-// static const float lr = 0.1;
-// static const float adamBeta1 = 0.9;
-// static const float adamBeta2 = 0.999;
+// #define SIMPLEX_VIS
 
 uniform int2 textureDim;
 
+// Optimized Nelder-Mead parameters (balanced for 64 iterations)
+static const float ALPHA = 1.3;  // reflection coefficient (moderately aggressive)
+static const float GAMMA = 2.2;  // expansion coefficient (balanced exploration)
+static const float RHO = 0.55;   // contraction coefficient (slightly more aggressive)
+static const float SIGMA = 0.45; // shrink coefficient (balanced shrinking)
+static const int MAX_ITERATIONS = 64;
+static const float GOOD_ENOUGH_LOSS = 0.004; // threshold for "good enough" initial solution
 
 // Uncompressed input texture
 Texture2D<float4> gInputTex;
@@ -18,195 +16,18 @@ Texture2D<float4> gInputTex;
 // Decoded BC texture
 RWTexture2D<float4> gDecodedTex;
 
+struct SimplexVertex
+{
+    float4 minEndPoints;
+    float4 maxEndPoints;
+    float score; // loss value
+};
+
 struct line4
 {
     float4 a;
     float4 b;
 };
-
-struct BCWeights : IDifferentiable
-{
-    float w[16];
-
-    __init(float _w)
-    {
-        for (int i = 0; i < 16; i++)
-            w[i] = _w;
-    }
-
-    __init(float _w[16])
-    {
-        for (int i = 0; i < 16; i++)
-            w[i] = _w[i];
-    }
-
-    [mutating]
-    void clamp()
-    {
-        for (int i = 0; i < 16; i++)
-            w[i] = clamp(w[i], 0, 1);
-    }
-
-    [mutating]
-    void quantize()
-    {
-        for (int i = 0; i < 15; i++)
-            w[i] = round(w[i] * 64) / 64;
-    }
-
-    BCWeights rsqrt()
-    {
-        BCWeights r;
-        for (int i = 0; i < 16; i++)
-            r.w[i] = rsqrt(w[i]);
-        return r;
-    }
-}
-
-BCWeights operator +(float a, BCWeights b)
-{
-    BCWeights r;
-    for (int i = 0; i < 16; i++)
-        r.w[i] = a + b.w[i];
-    return r;
-}
-
-BCWeights operator +(BCWeights a, BCWeights b)
-{
-    BCWeights r;
-    for (int i = 0; i < 16; i++)
-        r.w[i] = a.w[i] + b.w[i];
-    return r;
-}
-
-BCWeights operator -(BCWeights a, BCWeights b)
-{
-    BCWeights r;
-    for (int i = 0; i < 16; i++)
-        r.w[i] = a.w[i] - b.w[i];
-    return r;
-}
-
-BCWeights operator *(BCWeights a, BCWeights b)
-{
-    BCWeights r;
-    for (int i = 0; i < 16; i++)
-        r.w[i] = a.w[i] * b.w[i];
-    return r;
-}
-
-BCWeights operator *(float a, BCWeights b)
-{
-    BCWeights r;
-    for (int i = 0; i < 16; i++)
-        r.w[i] = a * b.w[i];
-    return r;
-}
-
-// This struct holds all of the data for a 4x4 texel tile
-struct BCTile : IDifferentiable
-{
-    BCWeights weights;
-    float4 minEndPoints;
-    float4 maxEndPoints;
-
-    __init()
-    {
-        weights = BCWeights(0.f);
-        minEndPoints = 0.f;
-        maxEndPoints = 0.f;
-    }
-
-    __init(BCTile.Differential tile)
-    {
-        weights = BCWeights(tile.weights.w);
-        minEndPoints = tile.minEndPoints;
-        maxEndPoints = tile.maxEndPoints;
-    }
-
-    __init(float _weight, float4 _minEndPoints, float4 _maxEndPoints)
-    {
-        weights = BCWeights(_weight);
-        minEndPoints = _minEndPoints;
-        maxEndPoints = _maxEndPoints;
-    }
-
-    [mutating]
-    void clamp()
-    {
-        weights.clamp();
-        minEndPoints = clamp(minEndPoints, 0, 1);
-        maxEndPoints = clamp(maxEndPoints, 0, 1);
-    }
-
-    [mutating]
-    void quantize()
-    {
-        weights.quantize();
-        minEndPoints = round(minEndPoints * 127) / 127;
-        maxEndPoints = round(maxEndPoints * 127) / 127;
-    }
-
-    BCTile rsqrt()
-    {
-        BCTile r;
-        r.weights = weights.rsqrt();
-        r.minEndPoints = rsqrt(minEndPoints);
-        r.maxEndPoints = rsqrt(maxEndPoints);
-        return r;
-    }
-
-    [BackwardDifferentiable]
-    float4 decode(int i)
-    {
-        return lerp(minEndPoints, maxEndPoints, weights.w[i]);
-    }
-}
-
-BCTile operator *(BCTile a, BCTile b)
-{
-    BCTile r;
-    r.weights = a.weights * b.weights;
-    r.minEndPoints = a.minEndPoints * b.minEndPoints;
-    r.maxEndPoints = a.maxEndPoints * b.maxEndPoints;
-    return r;
-}
-
-BCTile operator *(float a, BCTile b)
-{
-    BCTile r;
-    r.weights = a * b.weights;
-    r.minEndPoints = a * b.minEndPoints;
-    r.maxEndPoints = a * b.maxEndPoints;
-    return r;
-}
-
-BCTile operator +(float a, BCTile b)
-{
-    BCTile r;
-    r.weights = a + b.weights;
-    r.minEndPoints = a + b.minEndPoints;
-    r.maxEndPoints = a + b.maxEndPoints;
-    return r;
-}
-
-BCTile operator +(BCTile a, BCTile b)
-{
-    BCTile r;
-    r.weights = a.weights + b.weights;
-    r.minEndPoints = a.minEndPoints + b.minEndPoints;
-    r.maxEndPoints = a.maxEndPoints + b.maxEndPoints;
-    return r;
-}
-
-BCTile operator -(BCTile a, BCTile b)
-{
-    BCTile r;
-    r.weights = a.weights - b.weights;
-    r.minEndPoints = a.minEndPoints - b.minEndPoints;
-    r.maxEndPoints = a.maxEndPoints - b.maxEndPoints;
-    return r;
-}
 
 float4 normalize_safe(float4 a, float4 safe)
 {
@@ -327,15 +148,72 @@ void compute_unorm_end_point_and_unorm_weight(float4 block_texels[16], out float
     }
 }
 
-[BackwardDifferentiable]
-void l2Loss(BCTile tile, no_diff float4 target[16], out float loss[16])
+// Compute weights deterministically given endpoints
+void compute_weights(float4 minEndPoints, float4 maxEndPoints, float4 target[16], out float weights[16])
 {
-    [ForceUnroll]
+    float4 dir = maxEndPoints - minEndPoints;
+    float dirLength = length(dir);
+    
+    if (dirLength < 1e-6)
+    {
+        // Degenerate case - all weights become 0.5
+        for (int i = 0; i < 16; i++)
+            weights[i] = 0.5;
+        return;
+    }
+    
+    dir /= dirLength;
+    
     for (int i = 0; i < 16; i++)
     {
-        let delta = target[i] - tile.decode(i);
-        loss[i] = dot(delta, delta);
+        float proj = dot(target[i] - minEndPoints, dir);
+        weights[i] = saturate(proj / dirLength);
     }
+}
+
+// Compute total loss for a given set of endpoints
+float compute_loss(float4 minEndPoints, float4 maxEndPoints, float4 target[16])
+{
+    float totalLoss = 0;
+    float weights[16];
+    compute_weights(minEndPoints, maxEndPoints, target, weights);
+    
+    for (int i = 0; i < 16; i++)
+    {
+        float4 decoded = lerp(minEndPoints, maxEndPoints, weights[i]);
+        float4 delta = target[i] - decoded;
+        totalLoss += dot(delta, delta);
+    }
+    return totalLoss;
+}
+
+// Sort simplex vertices by score (ascending)
+void sort_simplex(inout SimplexVertex simplex[9])
+{
+    // Simple bubble sort
+    for (int i = 0; i < 8; i++)
+    {
+        for (int j = 0; j < 8 - i; j++)
+        {
+            if (simplex[j].score > simplex[j + 1].score)
+            {
+                SimplexVertex temp = simplex[j];
+                simplex[j] = simplex[j + 1];
+                simplex[j + 1] = temp;
+            }
+        }
+    }
+}
+
+// Compute centroid of all points except the worst
+float4 compute_centroid(SimplexVertex simplex[9], bool isMin)
+{
+    float4 centroid = 0;
+    for (int i = 0; i < 8; i++)
+    {
+        centroid += isMin ? simplex[i].minEndPoints : simplex[i].maxEndPoints;
+    }
+    return centroid / 8.0;
 }
 
 void encoder(uint2 tileId)
@@ -343,77 +221,158 @@ void encoder(uint2 tileId)
     let texel = 4 * tileId;
     if (any(texel >= textureDim)) return;
 
-    // Adam moments
-    BCTile m1, m2;
-
-    // Load target values and initialize with mid-point interpolation
-    // and minmax endpoints computed over the tile
+    // Load target values
     float4 target[16];
-    BCTile tile = BCTile(0.5, float4(1), float4(0));    
+    float4 minEndPoints = float4(1);
+    float4 maxEndPoints = float4(0);
+    
     for (int i = 0; i < 16; i++)
     {
         target[i] = gInputTex[texel + int2(i % 4, i / 4)];
-        tile.minEndPoints = min(tile.minEndPoints, target[i]);
-        tile.maxEndPoints = max(tile.maxEndPoints, target[i]);
+        minEndPoints = min(minEndPoints, target[i]);
+        maxEndPoints = max(maxEndPoints, target[i]);
     }
-#if 1 // Better Initial Value
+
+    // Initialize better endpoints using PCA-like method
     float4 endPt0, endPt1;
-    float weights[16];
-    compute_unorm_end_point_and_unorm_weight(target, endPt0, endPt1, weights);
-    tile.minEndPoints.xyz = endPt0.xyz;
-    tile.maxEndPoints.xyz = endPt1.xyz;
-    tile.weights = BCWeights(weights);
-#endif
+    float initialWeights[16];
+    compute_unorm_end_point_and_unorm_weight(target, endPt0, endPt1, initialWeights);
+    minEndPoints.xyz = endPt0.xyz;
+    maxEndPoints.xyz = endPt1.xyz;
+
+    // Check if PCA result is good enough
+    float initialLoss = compute_loss(minEndPoints, maxEndPoints, target);
+    bool needsSimplex = initialLoss > GOOD_ENOUGH_LOSS;
+    
+    if (!needsSimplex)
+    {
+        // PCA result is good enough, skip Nelder-Mead
+        float finalWeights[16];
+        compute_weights(minEndPoints, maxEndPoints, target, finalWeights);
+        
+        for (int i = 0; i < 16; i++)
+        {
+            float4 decoded = lerp(minEndPoints, maxEndPoints, finalWeights[i]);
+            gDecodedTex[texel + int2(i % 4, i / 4)] = decoded;
+        }
+        return;
+    }
 
 #if 1
-    // To compress the texture we perform a number of gradient descent steps
-    // to joint-optimize interpolation weights and endpoints for each tile.
-    // Eventually the interpolation weights are quantized and frozen,
-    // while the endpoints are fine tuned for a few more steps.
-    bool frozenWeight = false;
-    let endPointsFineTuninigThres = 0.85f;
-    for (int s = 0; s < kNumOptimizationSteps; s++)
+    // Initialize simplex with 9 vertices (8D + 1)
+    SimplexVertex simplex[9];
+    simplex[0].minEndPoints = minEndPoints;
+    simplex[0].maxEndPoints = maxEndPoints;
+    simplex[0].score = initialLoss;  // reuse computed loss
+
+    // Generate other vertices with small perturbations
+    for (int i = 1; i < 9; i++)
     {
-        // Forward pass - compute error
-        float loss[16];
-        l2Loss(tile, target, loss);
+        simplex[i].minEndPoints = minEndPoints;
+        simplex[i].maxEndPoints = maxEndPoints;
+        
+        // Perturb either min or max endpoints
+        if (i <= 4)
+            simplex[i].minEndPoints[i-1] = clamp(minEndPoints[i-1] + 0.1, 0, 1);
+        else
+            simplex[i].maxEndPoints[i-5] = clamp(maxEndPoints[i-5] + 0.1, 0, 1);
+            
+        simplex[i].score = compute_loss(simplex[i].minEndPoints, simplex[i].maxEndPoints, target);
+    }
 
-        // Backward pass - compute gradients
-        var dp_tile = diffPair(tile);
-        __bwd_diff(l2Loss)(dp_tile, target, {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1});
-
-        // Use Adam optimizer to update gradients
-        BCTile grad = BCTile(dp_tile.d);
-        if (kUseAdam)
+    // Main Nelder-Mead optimization loop
+    for (int iter = 0; iter < MAX_ITERATIONS; iter++)
+    {
+        sort_simplex(simplex);
+        
+        // Compute centroid of all points except worst
+        float4 centroidMin = compute_centroid(simplex, true);
+        float4 centroidMax = compute_centroid(simplex, false);
+        
+        // Reflection
+        float4 reflectedMin = centroidMin + ALPHA * (centroidMin - simplex[8].minEndPoints);
+        float4 reflectedMax = centroidMax + ALPHA * (centroidMax - simplex[8].maxEndPoints);
+        reflectedMin = clamp(reflectedMin, 0, 1);
+        reflectedMax = clamp(reflectedMax, 0, 1);
+        
+        float reflectedScore = compute_loss(reflectedMin, reflectedMax, target);
+        
+        if (reflectedScore < simplex[0].score)
         {
-            m1 = adamBeta1 * m1 + (1 - adamBeta1) * grad;
-            m2 = adamBeta2 * m2 + (1 - adamBeta2) * (grad * grad);
-            let unbiased_m1 = rcp(1.f - pow(adamBeta1, 1 + s)) * m1;
-            let unbiased_m2 = rcp(1.f - pow(adamBeta2, 1 + s)) * m2;
-            grad = unbiased_m1 * (1E-10f + unbiased_m2).rsqrt();
+            // Expansion
+            float4 expandedMin = centroidMin + GAMMA * (reflectedMin - centroidMin);
+            float4 expandedMax = centroidMax + GAMMA * (reflectedMax - centroidMax);
+            expandedMin = clamp(expandedMin, 0, 1);
+            expandedMax = clamp(expandedMax, 0, 1);
+            
+            float expandedScore = compute_loss(expandedMin, expandedMax, target);
+            
+            if (expandedScore < reflectedScore)
+            {
+                simplex[8].minEndPoints = expandedMin;
+                simplex[8].maxEndPoints = expandedMax;
+                simplex[8].score = expandedScore;
+            }
+            else
+            {
+                simplex[8].minEndPoints = reflectedMin;
+                simplex[8].maxEndPoints = reflectedMax;
+                simplex[8].score = reflectedScore;
+            }
         }
-
-        // If weights are frozen zero their gradient
-        if (frozenWeight)
-            grad.weights = BCWeights(0);
-
-        // Update BC tile via gradient descent & clamp its values to a valid range
-        tile = tile - lr * grad;
-        tile.clamp();
-
-        // Time to freeze the BC weights?
-        if (frozenWeight == false && float(s) / kNumOptimizationSteps >= endPointsFineTuninigThres)
+        else if (reflectedScore < simplex[7].score)
         {
-            // Quantize & freeze weights
-            // We will continue to fine tune the endpoints for a few more steps
-            frozenWeight = true;
-            tile.weights.quantize();
+            simplex[8].minEndPoints = reflectedMin;
+            simplex[8].maxEndPoints = reflectedMax;
+            simplex[8].score = reflectedScore;
+        }
+        else
+        {
+            // Contraction
+            float4 contractedMin = centroidMin + RHO * (simplex[8].minEndPoints - centroidMin);
+            float4 contractedMax = centroidMax + RHO * (simplex[8].maxEndPoints - centroidMax);
+            contractedMin = clamp(contractedMin, 0, 1);
+            contractedMax = clamp(contractedMax, 0, 1);
+            
+            float contractedScore = compute_loss(contractedMin, contractedMax, target);
+            
+            if (contractedScore < simplex[8].score)
+            {
+                simplex[8].minEndPoints = contractedMin;
+                simplex[8].maxEndPoints = contractedMax;
+                simplex[8].score = contractedScore;
+            }
+            else
+            {
+                // Shrink
+                for (int i = 1; i < 9; i++)
+                {
+                    simplex[i].minEndPoints = simplex[0].minEndPoints + SIGMA * (simplex[i].minEndPoints - simplex[0].minEndPoints);
+                    simplex[i].maxEndPoints = simplex[0].maxEndPoints + SIGMA * (simplex[i].maxEndPoints - simplex[0].maxEndPoints);
+                    simplex[i].minEndPoints = clamp(simplex[i].minEndPoints, 0, 1);
+                    simplex[i].maxEndPoints = clamp(simplex[i].maxEndPoints, 0, 1);
+                    simplex[i].score = compute_loss(simplex[i].minEndPoints, simplex[i].maxEndPoints, target);
+                }
+            }
         }
     }
+
+    // Use best solution found
+    sort_simplex(simplex);
+    minEndPoints = simplex[0].minEndPoints;
+    maxEndPoints = simplex[0].maxEndPoints;
 #endif
 
-    // Quantize & write out decoded tile
-    tile.quantize();
+    // Compute final weights and write output
+    float finalWeights[16];
+    compute_weights(minEndPoints, maxEndPoints, target, finalWeights);
+    
     for (int i = 0; i < 16; i++)
-        gDecodedTex[texel + int2(i % 4, i / 4)] = tile.decode(i);;
+    {
+        float4 decoded = lerp(minEndPoints, maxEndPoints, finalWeights[i]);
+#ifdef SIMPLEX_VIS
+        decoded.rgb = float3(1, 0, 0);  // Mark Simplex blocks in red
+#endif
+        gDecodedTex[texel + int2(i % 4, i / 4)] = decoded;
+    }
 }
