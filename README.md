@@ -1,8 +1,17 @@
 # tinyBC
 
-**A minimal GPU texture block compressor in ~450 lines of code.**
+**Minimal GPU texture compression — two approaches in readable code.**
 
-tinyBC implements BC7 Mode 6 texture compression entirely on the GPU using a [Slang](https://shader-slang.com/) compute shader + a Python driver via [SlangPy](https://shader-slang.com/slang-python/). It compresses a texture in real-time, achieving ~40 dB PSNR, and fits in two small files you can read in one sitting.
+This repo contains two tiny, self-contained texture compressors you can read in one sitting:
+
+| | **tinyBC** | **tinyMLP** |
+|---|---|---|
+| Approach | Classic block compression (BC7 Mode 6) | Neural image compression (MLP) |
+| Core idea | 2 endpoint colors + 16 weights per 4×4 block | Network weights memorize the entire image |
+| Runs on | GPU via [Slang](https://shader-slang.com/) compute shader | GPU via PyTorch |
+| PSNR | ~40 dB | ~28 dB @ 5x compression |
+| Compression | 4:1 (fixed) | Tunable (3–12x) |
+| Interactive | — | Real-time training visualization |
 
 <p align="center">
   <img src="images/fig_comparison.png" alt="Compression quality comparison" width="100%"/>
@@ -21,6 +30,10 @@ tinyBC implements BC7 Mode 6 texture compression entirely on the GPU using a [Sl
   - [Step 1: PCA Initial Guess](#step-1-pca-initial-guess)
   - [Step 2: Nelder-Mead Refinement](#step-2-nelder-mead-refinement)
   - [The Pipeline](#the-full-pipeline)
+- [tinyMLP: Neural Image Compression](#tinymlp-neural-image-compression)
+  - [The Idea](#the-idea)
+  - [Fourier Features](#fourier-features-teaching-the-mlp-to-see-detail)
+  - [Interactive Demo](#interactive-demo)
 - [Results](#results)
 - [Code Walkthrough](#code-walkthrough)
 - [License](#license)
@@ -29,13 +42,13 @@ tinyBC implements BC7 Mode 6 texture compression entirely on the GPU using a [Sl
 
 ## Quick Start
 
-**Prerequisites:** Python 3.10+, a GPU with Vulkan support, and [SlangPy](https://shader-slang.com/slang-python/) installed.
+### tinyBC — Block Compression
+
+**Prerequisites:** Python 3.10+, a GPU with Vulkan support, [SlangPy](https://shader-slang.com/slang-python/).
 
 ```bash
 pip install slangpy sgl numpy
 ```
-
-**Run the compressor:**
 
 ```bash
 python tinybc.py                          # compress sample.jpg, print PSNR
@@ -43,7 +56,22 @@ python tinybc.py -i photo.png -o out.png  # custom input, save decoded output
 python tinybc.py -b                       # benchmark mode (1000 iterations)
 ```
 
-That's it. Two files, zero build system.
+### tinyMLP — Neural Compression
+
+**Prerequisites:** Python 3.10+, PyTorch, OpenCV (optional, for interactive window).
+
+```bash
+pip install torch opencv-python
+```
+
+```bash
+python tinyMLP.py                          # train on sample.jpg, watch it learn
+python tinyMLP.py -i photo.png             # custom input
+python tinyMLP.py --hidden 64 --depth 2    # smaller model = higher compression
+python tinyMLP.py --save model.pth         # save trained weights
+```
+
+**Controls:** `Q`/`ESC` quit, `Space` pause/resume, `S` save snapshot.
 
 ---
 
@@ -145,7 +173,66 @@ After up to 64 iterations, the simplex converges to a local (often global) minim
 
 ---
 
+## tinyMLP: Neural Image Compression
+
+### The Idea
+
+What if, instead of hand-crafted block partitions, we let a **neural network** learn to compress the image?
+
+tinyMLP takes a radically different approach: train a small MLP (multi-layer perceptron) to map pixel coordinates to colors:
+
+```
+input: (x, y)  →  MLP  →  output: (r, g, b)
+```
+
+The "compressed file" is just the **network weights**. A 38K-parameter network weighs ~152KB — for a 512×512 image that's **5× compression** with no block artifacts.
+
+| What's stored | Block compression (tinyBC) | Neural compression (tinyMLP) |
+|---|---|---|
+| Per-block data | 2 endpoints + 16 weights | — |
+| Global model | — | MLP weights (~152KB) |
+| Decoding | `lerp(A, B, w)` per pixel | Forward pass through network |
+| Artifacts | Block boundaries | Smooth, frequency-dependent blur |
+| Compression ratio | Fixed 4:1 | Tunable via model size |
+
+### Fourier Features: Teaching the MLP to See Detail
+
+A naive MLP with raw `(x, y)` inputs struggles with high-frequency content (sharp edges, texture detail) — a well-known problem called **spectral bias**. The network will learn low frequencies first and may never converge on fine detail.
+
+The solution: **Fourier positional encoding**. Before feeding coordinates to the MLP, we expand them into sine and cosine waves at multiple frequencies:
+
+```
+(x, y) → (x, y, sin(πx), cos(πx), sin(2πx), cos(2πx), ..., sin(2^L πx), ...)
+```
+
+This transforms a 2D input into a ~42-dimensional feature vector, giving the network explicit "frequency handles" to grab onto. The parameter `L` (number of frequency bands) controls how much detail the MLP can represent.
+
+### Interactive Demo
+
+Run `python tinyMLP.py` to watch the network learn an image in real-time:
+
+1. The window shows **Original** (left) and **MLP Reconstruction** (right) side by side.
+2. In the first seconds, you'll see a blurry, impressionistic version appear — the low frequencies.
+3. Over the next minute, edges sharpen and details emerge as the network learns higher frequencies.
+4. The status bar tracks step count, PSNR, loss, and compression ratio live.
+
+<p align="center">
+  <img src="images/fig_mlp_demo.png" alt="tinyMLP interactive demo" width="100%"/>
+</p>
+
+Try different model sizes to see the quality/compression tradeoff:
+
+```bash
+python tinyMLP.py --hidden 256 --depth 4   # big model:   ~1x ratio, ~32 dB
+python tinyMLP.py --hidden 128 --depth 3   # default:     ~5x ratio, ~28 dB
+python tinyMLP.py --hidden 64  --depth 2   # tiny model: ~20x ratio, ~22 dB
+```
+
+---
+
 ## Results
+
+### tinyBC — Block Compression
 
 | Metric | PCA Only | PCA + Nelder-Mead |
 |---|---|---|
@@ -160,13 +247,21 @@ The Nelder-Mead refinement adds ~1.6 dB PSNR — a meaningful improvement, espec
 
 The error maps (bottom row) use the `inferno` colormap — brighter means more error. Notice how the Nelder-Mead version has fewer bright spots, especially around the grille bars and headlight edges where color variation is highest.
 
+### tinyMLP — Neural Compression
+
+| Model config | Params | Size | Ratio | PSNR (5000 steps) |
+|---|---|---|---|---|
+| `--hidden 256 --depth 4` | 209K | 836KB | ~1x | ~32 dB |
+| `--hidden 128 --depth 3` (default) | 39K | 152KB | ~5x | ~28 dB |
+| `--hidden 64 --depth 2` | 9K | 38KB | ~20x | ~22 dB |
+
+Neural compression trades decoding speed for a completely different artifact profile — smooth, organic degradation rather than blocky boundaries.
+
 ---
 
 ## Code Walkthrough
 
-The entire project is two files:
-
-### `tinybc.slang` — The GPU Compressor (~379 lines)
+### `tinybc.slang` — The GPU Block Compressor (~379 lines)
 
 | Section | Lines | What it does |
 |---|---|---|
@@ -177,18 +272,23 @@ The entire project is two files:
 | `compute_centroid` | 209–217 | Mean of the 8 best vertices (excluding the worst) |
 | `encoder` | 219–378 | Main entry point: load block → PCA → (optional) Nelder-Mead → write output |
 
-### `tinybc.py` — The Python Driver (~72 lines)
+### `tinybc.py` — The BC7 Python Driver (~72 lines)
 
 Loads the input texture via `sgl.TextureLoader`, creates an output texture, dispatches the `encoder` kernel over all 4×4 tiles, and computes PSNR.
 
+### `tinyMLP.py` — Neural Compressor (~200 lines)
+
+A self-contained PyTorch script: `FourierFeatures` positional encoding → `ImageMLP` network → Adam training loop with cosine LR schedule → real-time OpenCV/matplotlib visualization.
+
 ```
 tinyASTC/
-├── tinybc.slang       # GPU compute shader (the compressor)
-├── tinybc.py          # Python driver script
-├── sample.jpg         # Test input image
+├── tinybc.slang        # GPU compute shader (block compressor)
+├── tinybc.py           # BC7 driver script
+├── tinyMLP.py          # Neural image compression with live visualization
+├── sample.jpg          # Test input image
 ├── generate_figures.py # Generate README figures
-├── images/            # Generated figures
-└── LICENSE            # MIT
+├── images/             # Generated figures
+└── LICENSE             # MIT
 ```
 
 ---
