@@ -4,14 +4,15 @@
 
 This repo contains two tiny, self-contained texture compressors you can read in one sitting:
 
-| | **tinyBC** | **tinyMLP** |
-|---|---|---|
-| Approach | Classic block compression (BC7 Mode 6) | Neural image compression (MLP) |
-| Core idea | 2 endpoint colors + 16 weights per 4×4 block | Network weights memorize the entire image |
-| Runs on | GPU via [Slang](https://shader-slang.com/) compute shader | GPU via PyTorch |
-| PSNR | ~40 dB | ~39 dB @ 2x compression |
-| Compression | 4:1 (fixed) | Tunable (2–16x) |
-| Interactive | — | Real-time training visualization |
+| | **tinyBC** | **tinyMLP (Hash)** | **tinyLatent** |
+|---|---|---|---|
+| Approach | Classic block compression (BC7 Mode 6) | Neural: multi-res hash tables + SIREN | Neural: dense latent texture grid + SIREN |
+| Core idea | 2 endpoint colors + 16 weights per 4×4 block | Hash lookup → 32 features → decode | Bilinear-sampled 2D grid → 32 features → decode |
+| Runs on | GPU via [Slang](https://shader-slang.com/) compute shader | GPU via PyTorch | GPU via PyTorch |
+| PSNR | ~40 dB | ~39.4 dB @ 1.9x | ~37.8 dB @ 1.4x |
+| Compression | 4:1 (fixed) | Tunable (2–16x) | Tunable via `--scale` and `--channels` |
+| Two-stage | — | — | Latent grid → JPEG for extra savings |
+| Interactive | — | Real-time visualization | Real-time + optional latent panel |
 
 <p align="center">
   <img src="images/fig_comparison.png" alt="Compression quality comparison" width="100%"/>
@@ -33,6 +34,7 @@ This repo contains two tiny, self-contained texture compressors you can read in 
 - [tinyMLP: Neural Image Compression](#tinymlp-neural-image-compression)
   - [The Idea](#the-idea)
   - [Architecture: Hash Encoding + SIREN](#architecture-hash-encoding--siren)
+  - [Latent Texture: a Different Compression Primitive](#latent-texture-a-different-compression-primitive)
   - [Interactive Demo](#interactive-demo)
 - [Results](#results)
 - [Code Walkthrough](#code-walkthrough)
@@ -56,7 +58,7 @@ python tinybc.py -i photo.png -o out.png  # custom input, save decoded output
 python tinybc.py -b                       # benchmark mode (1000 iterations)
 ```
 
-### tinyMLP — Neural Compression
+### tinyMLP — Neural Compression (Hash Encoding)
 
 **Prerequisites:** Python 3.10+, PyTorch, OpenCV (optional, for interactive window).
 
@@ -65,13 +67,22 @@ pip install torch opencv-python
 ```
 
 ```bash
-python tinyMLP.py                                    # train on sample.jpg, watch it learn
+python tinyMLP.py                                    # train on sample.png, watch it learn
 python tinyMLP.py -i photo.png                       # custom input
 python tinyMLP.py --log2_T 10 --hidden 32 --depth 1  # tiny model, ~16x compression
 python tinyMLP.py --save model.pth                   # save trained weights
 ```
 
 **Controls:** `Q`/`ESC` quit, `Space` pause/resume, `S` save snapshot.
+
+### tinyLatent — Neural Compression (Latent Texture)
+
+```bash
+python tinyLatent.py                          # train on sample.png (default)
+python tinyLatent.py --vis_latent             # show latent grid evolution in 3rd panel
+python tinyLatent.py --scale 4 --channels 16  # finer grid, fewer channels
+python tinyLatent.py --save_latent lat.npy    # save latent as float16 (compressed artifact)
+```
 
 ---
 
@@ -219,6 +230,68 @@ The 32 hash features are decoded by 2 hidden layers using `sin(ω₀ · Wx + b)`
 
 **Two separate learning rates** ensure stable training: the hash tables update fast (`lr=3e-2`), the SIREN decoder updates slowly (`lr=1e-3`).
 
+### Latent Texture: a Different Compression Primitive
+
+`tinyLatent.py` swaps the **sparse hash tables** for a **dense 2D feature grid** — the _latent texture_ — while keeping the SIREN decoder identical.  This makes the comparison orthogonal: only the encoder changes.
+
+```
+HashEncoding  →  32 features  ─┐
+                                ├─ same SIREN decoder ─ (r, g, b)
+LatentTexture →  32 features  ─┘
+```
+
+**How the latent texture works:**  
+A learnable parameter tensor of shape `C × (H/scale) × (W/scale)` (e.g. `32 × 64 × 64` for a 512×512 image with `--scale 8`) is sampled at the query coordinate using `F.grid_sample` (bilinear, border padding).  The downscaled grid acts as a compressible intermediate representation:
+
+- **Spatial coherence** is enforced by construction — nearby pixels read similar features.
+- **The grid can be saved as float16 `.npy`** and further compressed with standard image codecs (JPEG, PNG), enabling true two-stage compression.
+- **No hash collisions** — every feature occupies an explicit spatial slot. This trades capacity for interpretability: you can literally visualise what the network remembers.
+
+#### Orthogonal Comparison
+
+Both models use the same `hidden=64, depth=2` SIREN decoder and are trained for the same number of steps on the same lossless `sample.png`:
+
+| Encoder | Params | @500 steps | @2000 steps | @5000 steps |
+|---|---|---|---|---|
+| Hash Default (`log2_T=12`) | 101,399 | 35.0 dB | 37.7 dB | **39.4 dB** |
+| Latent Default (`scale=8, ch=32`) | 137,539 | 31.3 dB | 35.8 dB | **37.8 dB** |
+
+**Key observations:**
+- Hash encoding converges significantly faster (35.0 vs 31.3 dB at step 500), owing to its multi-resolution design: coarse levels learn broad structure instantly while fine levels fill in detail.
+- Latent texture closes the gap over time but remains ~1–2 dB behind at equal step count for matched parameter budget.
+- The latent grid's advantage: it is a **concrete, spatial artifact** — you can visualise, quantise, and compress it with existing tools.
+
+<p align="center">
+  <img src="images/fig_latent_vs_hash_grid.png" alt="Hash vs Latent quality grid" width="100%"/>
+</p>
+
+<p align="center">
+  <img src="images/fig_latent_vs_hash_curves.png" alt="PSNR curves: Hash vs Latent" width="75%"/>
+</p>
+
+#### Inside the Latent Grid
+
+The figure below shows (left to right): the original image crop, the first three latent channels rendered as RGB, the final reconstruction, and the per-pixel error heatmap.
+
+<p align="center">
+  <img src="images/fig_latent_visualization.png" alt="Latent texture internals" width="100%"/>
+</p>
+
+The latent channel preview shows a blurry, compressed-looking version of the scene — the network has "pre-decoded" the image into a coarse feature map, leaving the SIREN decoder to hallucinate fine-grained texture from position alone.
+
+#### Two-Stage Compression Potential
+
+Because the latent grid is a regular float array, you can compress it a second time:
+
+```python
+# Save latent as float16
+python tinyLatent.py --save_latent latent.npy
+# Latent (.npy fp16): ~256 KB for 32×64×64
+# Further compress with JPEG (Q=85): typically ~30–60 KB additional savings
+```
+
+For a 512×512 image (~768 KB uncompressed), combining float16 latent + fp16 decoder weights + JPEG compression of the latent grid can push effective ratios beyond 5×, at the cost of some reconstruction quality from quantisation artefacts.
+
 ### Interactive Demo
 
 Run `python tinyMLP.py` to watch the network learn an image in real-time:
@@ -283,6 +356,17 @@ The error maps (bottom row) use the `inferno` colormap — brighter means more e
 
 Switching from Fourier+GELU to Hash Encoding+SIREN boosted Default config by **+11.5 dB PSNR**. Neural compression still trades decoding throughput for smooth, artifact-free quality — but at these PSNR levels the reconstructions are visually nearly indistinguishable from the original.
 
+### tinyLatent — Neural Compression (Latent Texture + SIREN)
+
+Same SIREN decoder as tinyMLP (identical `hidden=64, depth=2`). Only the encoder changes — sparse hash tables → dense bilinear-sampled grid.
+
+| Encoder | Params | Size | Compression | 500 steps | 2000 steps | 5000 steps |
+|---|---|---|---|---|---|---|
+| Hash Default (`log2_T=12`) | 101,399 | 397 KB | **1.9x** | 35.0 dB | 37.7 dB | **39.4 dB** |
+| Latent Default (`scale=8, ch=32`) | 137,539 | 539 KB | **1.4x** | 31.3 dB | 35.8 dB | **37.8 dB** |
+
+Hash encoding converges faster and reaches higher PSNR at equal step count. The latent texture's advantage is its spatial interpretability and two-stage compression potential.
+
 ---
 
 ## Code Walkthrough
@@ -302,7 +386,7 @@ Switching from Fourier+GELU to Hash Encoding+SIREN boosted Default config by **+
 
 Loads the input texture via `sgl.TextureLoader`, creates an output texture, dispatches the `encoder` kernel over all 4×4 tiles, and computes PSNR.
 
-### `tinyMLP.py` — Neural Compressor (~280 lines)
+### `tinyMLP.py` — Hash Encoding Neural Compressor (~280 lines)
 
 | Class / function | What it does |
 |---|---|
@@ -312,14 +396,35 @@ Loads the input texture via `sgl.TextureLoader`, creates an output texture, disp
 | `render_full` | Chunked full-image forward pass (avoids OOM on large images) |
 | `main` | Arg parsing, dual-LR Adam optimizer, cosine LR schedule, OpenCV/mpl display loop |
 
+### `tinyLatent.py` — Latent Texture Neural Compressor (~260 lines)
+
+| Class / function | What it does |
+|---|---|
+| `LatentTexture` | Dense `C × (H/scale) × (W/scale)` parameter grid; bilinear `F.grid_sample` lookup |
+| `LatentImageMLP` | Combines `LatentTexture` → `SirenLayer` stack → `Linear + Sigmoid` (same decoder as tinyMLP) |
+| `estimate_jpeg_size` | Estimates compressed latent size via PIL JPEG encoding to gauge two-stage compression potential |
+| `main` | Single-LR Adam, cosine schedule, optional `--vis_latent` 3rd panel, `--save_latent` float16 export |
+
+### `generate_mlp_figures.py` — Figure Generator
+
+| Function | Output |
+|---|---|
+| `fig_mlp_architecture` | `images/fig_mlp_architecture.png` — Hash Encoding + SIREN architecture diagram |
+| `train_snapshots` | Headless Hash model training; returns PSNR snapshots + curve |
+| `fig_mlp_comparison` | `images/fig_mlp_comparison.png` + `fig_mlp_psnr_curve.png` — Hash model grid |
+| `train_latent_snapshots` | Headless Latent model training; returns PSNR snapshots + curve |
+| `fig_latent_vs_hash` | `images/fig_latent_vs_hash_grid.png` + `fig_latent_vs_hash_curves.png` — orthogonal comparison |
+| `fig_latent_visualization` | `images/fig_latent_visualization.png` — 4-panel latent internals figure |
+
 ```
 tinyASTC/
 ├── tinybc.slang             # GPU compute shader (block compressor)
 ├── tinybc.py                # BC7 driver script
-├── tinyMLP.py               # Neural image compression with live visualization
-├── sample.jpg               # Test input image
+├── tinyMLP.py               # Neural compression — Hash Encoding + SIREN
+├── tinyLatent.py            # Neural compression — Latent Texture + SIREN
+├── sample.png               # Test input image (lossless)
 ├── generate_figures.py      # Generate tinyBC educational figures
-├── generate_mlp_figures.py  # Generate tinyMLP architecture + comparison figures
+├── generate_mlp_figures.py  # Generate all MLP comparison figures
 ├── images/                  # All generated figures
 └── LICENSE                  # MIT
 ```

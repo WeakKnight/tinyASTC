@@ -1,8 +1,14 @@
 """Generate MLP architecture diagram and training comparison figures.
 
-Usage: python generate_mlp_figures.py
+Usage:
+  python generate_mlp_figures.py              # everything
+  python generate_mlp_figures.py --arch-only  # architecture diagram only
+  python generate_mlp_figures.py --hash-only  # hash comparison figures only
+  python generate_mlp_figures.py --latent-only # latent vs hash figures only
+
 Requires: torch, matplotlib, Pillow, numpy
 """
+import argparse
 import sys
 import pathlib
 import time
@@ -21,6 +27,7 @@ from PIL import Image
 local_dir = pathlib.Path(__file__).parent.absolute()
 sys.path.insert(0, str(local_dir))
 from tinyMLP import HashEncoding, SirenLayer, ImageMLP, render_full
+from tinyLatent import LatentTexture, LatentImageMLP
 
 import os
 os.makedirs('images', exist_ok=True)
@@ -357,22 +364,264 @@ def all_configs_results(configs, all_snaps, all_params, all_ratios, steps):
 
 
 # ====================================================================
+# Latent training helper — mirrors train_snapshots but uses LatentImageMLP
+# ====================================================================
+def train_latent_snapshots(img_np, H, W, scale, channels,
+                           hidden=64, depth=2, omega_0=30.0,
+                           total_steps=5000, snapshot_steps=(500, 2000, 5000),
+                           lr=3e-3, batch=2**16):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    gy, gx = torch.meshgrid(torch.linspace(-1, 1, H),
+                             torch.linspace(-1, 1, W), indexing='ij')
+    all_coords = torch.stack([gx, gy], dim=-1).reshape(-1, 2).to(device)
+    all_colors  = torch.from_numpy(img_np).reshape(-1, 3).to(device)
+    N = all_coords.shape[0]
+
+    model = LatentImageMLP(H=H, W=W, scale=scale, channels=channels,
+                           hidden=hidden, depth=depth, omega_0=omega_0).to(device)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-15)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
+
+    snapshots = {}
+    psnr_curve = []
+    snap_set = set(snapshot_steps)
+    curve_interval = max(total_steps // 20, 50)
+
+    t0 = time.time()
+    for step in range(1, total_steps + 1):
+        model.train()
+        idx = torch.randint(0, N, (min(batch, N),), device=device)
+        pred = model(all_coords[idx])
+        loss = ((pred - all_colors[idx]) ** 2).mean()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if step in snap_set or step % curve_interval == 0:
+            recon = render_full(model, all_coords, H, W)
+            mse = np.mean((img_np - recon) ** 2)
+            psnr = 20 * np.log10(1.0 / max(np.sqrt(mse), 1e-10))
+            psnr_curve.append((step, psnr))
+            if step in snap_set:
+                lat_preview = model.encoder.to_rgb_preview()
+                snapshots[step] = (np.clip(recon, 0, 1), psnr, lat_preview)
+                print(f"  step {step:5d}/{total_steps}  PSNR {psnr:.2f} dB  ({time.time()-t0:.1f}s)")
+
+    img_bytes = H * W * 3
+    lat_params = model.encoder.latent.numel()
+    net_params  = model.param_count - lat_params
+    latent_np   = model.encoder.latent.detach().cpu().numpy()
+    return snapshots, psnr_curve, model.param_count, img_bytes / model.size_bytes, latent_np, lat_params, net_params
+
+
+# ====================================================================
+# Figure: Latent vs Hash orthogonal comparison
+# ====================================================================
+def fig_latent_vs_hash(img_np):
+    """Train matched-budget Hash and Latent models; produce comparison grid + curves."""
+    H, W, _ = img_np.shape
+    img_bytes = H * W * 3
+    STEPS = [500, 2000, 5000]
+
+    # ── Default-budget Hash config ────────────────────────────────────────
+    hash_cfg_default = dict(n_levels=16, n_features=2, log2_T=12,
+                            hidden=64, depth=2)
+    # ── Matched Latent config (scale=8, channels=32 → ~same KB as Hash Default) ──
+    latent_scale_default, latent_ch_default = 8, 32
+
+    print("\n[Hash Default]  Training ...")
+    h_snaps, h_curve, h_params, h_ratio = train_snapshots(
+        img_np, hash_cfg_default, total_steps=5000, snapshot_steps=STEPS)
+
+    print("\n[Latent Default]  Training ...")
+    l_snaps, l_curve, l_params, l_ratio, latent_np, lat_p, net_p = train_latent_snapshots(
+        img_np, H, W,
+        scale=latent_scale_default, channels=latent_ch_default,
+        total_steps=5000, snapshot_steps=STEPS)
+
+    # ── Grid figure (2 rows × 4 cols) ───────────────────────────────────
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9.5), facecolor='white')
+    plt.subplots_adjust(wspace=0.04, hspace=0.30)
+
+    row_labels = [
+        f'Hash Encoding\n{h_params:,} params  {h_ratio:.1f}x',
+        f'Latent Texture\n{l_params:,} params  {l_ratio:.1f}x',
+    ]
+    col_labels = ['Original'] + [f'{s} steps' for s in STEPS]
+    col_colors = ['#333333', '#1565C0', '#1565C0', '#1565C0']
+
+    for j, (lbl, col) in enumerate(zip(col_labels, col_colors)):
+        ax = axes[0, j]
+        ax.set_title(lbl, fontsize=11.5, fontweight='bold', color=col, pad=6)
+
+    for i, (snaps, row_lbl) in enumerate(
+            [(h_snaps, row_labels[0]), (l_snaps, row_labels[1])]):
+        # Original column
+        axes[i, 0].imshow(img_np)
+        axes[i, 0].axis('off')
+        axes[i, 0].text(-0.04, 0.5, row_lbl,
+                        transform=axes[i, 0].transAxes,
+                        ha='right', va='center', fontsize=9, color='#333333',
+                        rotation=0, wrap=True,
+                        bbox=dict(boxstyle='round,pad=0.35', fc='#F5F5F5',
+                                  ec='#BDBDBD', alpha=0.9))
+        for j, step in enumerate(STEPS):
+            ax = axes[i, j + 1]
+            recon, psnr = snaps[step][0], snaps[step][1]
+            ax.imshow(recon)
+            ax.axis('off')
+            color = '#1B5E20' if psnr >= 33 else '#2E7D32' if psnr >= 28 else '#E65100'
+            ax.set_title(f'PSNR {psnr:.1f} dB', fontsize=9.5, color=color, pad=3)
+
+    fig.suptitle('Hash Encoding vs Latent Texture — Matched Parameter Budget  (~same KB)',
+                 fontsize=14, fontweight='bold', y=1.00)
+    plt.savefig('images/fig_latent_vs_hash_grid.png', dpi=150,
+                bbox_inches='tight', facecolor='white')
+    plt.close()
+    print("\nGenerated: images/fig_latent_vs_hash_grid.png")
+
+    # ── Curve figure ─────────────────────────────────────────────────────
+    fig2, ax2 = plt.subplots(figsize=(10, 5.5), facecolor='white')
+    curve_data = [
+        (h_curve, '#1E88E5', f'Hash Default  ({h_params:,} params, {h_ratio:.1f}x)'),
+        (l_curve, '#E53935', f'Latent Default ({l_params:,} params, {l_ratio:.1f}x)'),
+    ]
+    for curve, color, label in curve_data:
+        xs = [s for s, _ in curve]
+        ys = [p for _, p in curve]
+        ax2.plot(xs, ys, '-', color=color, label=label, linewidth=2.2)
+        for step in STEPS:
+            sy = [p for s, p in curve if s == step]
+            if sy:
+                ax2.plot([step], sy, 'o', color=color, markersize=7,
+                         markeredgecolor='white', markeredgewidth=1, zorder=5)
+                ax2.annotate(f'{sy[0]:.1f}',  (step, sy[0]),
+                             textcoords='offset points', xytext=(4, 5),
+                             fontsize=8.5, color=color, fontweight='bold')
+
+    ax2.set_xlabel('Training Steps', fontsize=12)
+    ax2.set_ylabel('PSNR (dB)', fontsize=12)
+    ax2.set_title('Hash Encoding vs Latent Texture: PSNR vs Training Steps\n'
+                  '(same SIREN decoder, matched parameter budget)',
+                  fontsize=12, fontweight='bold')
+    ax2.legend(fontsize=10, framealpha=0.92)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(left=0)
+    fig2.tight_layout()
+    fig2.savefig('images/fig_latent_vs_hash_curves.png', dpi=150,
+                 bbox_inches='tight', facecolor='white')
+    plt.close()
+    print("Generated: images/fig_latent_vs_hash_curves.png")
+
+    # Collect PSNR summary dict for README
+    results = {
+        'hash':   {'params': h_params, 'ratio': h_ratio,
+                   **{f'psnr_{s}': h_snaps[s][1] for s in STEPS}},
+        'latent': {'params': l_params, 'ratio': l_ratio,
+                   **{f'psnr_{s}': l_snaps[s][1] for s in STEPS}},
+    }
+
+    # Also generate latent visualization using the final-step latent preview
+    fig_latent_visualization(img_np, latent_np,
+                             l_snaps[STEPS[-1]][0], l_snaps[STEPS[-1]][2])
+    return results
+
+
+# ====================================================================
+# Figure: Latent visualization (4-panel)
+# ====================================================================
+def fig_latent_visualization(img_np, latent_np, recon_np, latent_preview_np):
+    """4-panel figure: original crop | latent RGB preview | reconstruction | error."""
+    H, W, _ = img_np.shape
+
+    # Central crop
+    cy, cx = H // 2, W // 2
+    h_crop = min(H, 256)
+    w_crop = min(W, 256)
+    orig_crop   = img_np[cy-h_crop//2:cy+h_crop//2, cx-w_crop//2:cx+w_crop//2]
+    recon_crop  = recon_np[cy-h_crop//2:cy+h_crop//2, cx-w_crop//2:cx+w_crop//2]
+
+    # Per-pixel error heatmap
+    err = np.mean((orig_crop - np.clip(recon_crop, 0, 1)) ** 2, axis=-1)
+    err_norm = err / (err.max() + 1e-8)
+
+    # Latent grid RGB preview (resize to crop size)
+    lat_img = Image.fromarray(latent_preview_np)
+    lat_img = lat_img.resize((w_crop, h_crop), Image.NEAREST)
+    lat_arr = np.array(lat_img)
+
+    fig, axes = plt.subplots(1, 4, figsize=(18, 5), facecolor='white')
+    panels = [
+        (orig_crop,              'Original Crop',        None,       'gray'),
+        (lat_arr,                'Latent Grid  (ch 0–2)', None,      '#E65100'),
+        (np.clip(recon_crop, 0, 1), 'Reconstruction',   None,       'teal'),
+        (err_norm,               'Error Heatmap',        'inferno',  '#B71C1C'),
+    ]
+    for ax, (arr, title, cmap, tcolor) in zip(axes, panels):
+        if cmap:
+            ax.imshow(arr, cmap=cmap, vmin=0, vmax=1)
+        else:
+            ax.imshow(arr)
+        ax.set_title(title, fontsize=12, fontweight='bold', color=tcolor, pad=5)
+        ax.axis('off')
+
+    fig.suptitle('Latent Texture Internals — what the model "memorized"',
+                 fontsize=13, fontweight='bold', y=1.01)
+    plt.tight_layout()
+    plt.savefig('images/fig_latent_visualization.png', dpi=150,
+                bbox_inches='tight', facecolor='white')
+    plt.close()
+    print("Generated: images/fig_latent_visualization.png")
+
+
+# ====================================================================
 # Run all
 # ====================================================================
 if __name__ == '__main__':
-    print("=== Generating architecture diagram ===")
-    fig_mlp_architecture()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--arch-only',   action='store_true')
+    parser.add_argument('--hash-only',   action='store_true')
+    parser.add_argument('--latent-only', action='store_true')
+    args = parser.parse_args()
 
-    print("\n=== Training models for comparison figures ===")
-    img_np = np.array(Image.open(local_dir / 'sample.jpg').convert('RGB'),
+    run_arch   = not (args.hash_only or args.latent_only)
+    run_hash   = not (args.arch_only or args.latent_only)
+    run_latent = not (args.arch_only or args.hash_only)
+
+    # Load image — use lossless PNG for clean PSNR numbers
+    img_path = local_dir / 'sample.png'
+    if not img_path.exists():
+        img_path = local_dir / 'sample.jpg'
+    img_np = np.array(Image.open(img_path).convert('RGB'),
                       dtype=np.float32) / 255.0
-    results = fig_mlp_comparison(img_np)
+    print(f"Image: {img_path.name}  {img_np.shape[1]}×{img_np.shape[0]}")
 
-    print("\n\n=== Summary ===")
-    for r in results:
-        print(f"{r['label']:50s}  "
-              f"{r['params']:>8,} params  "
-              f"{r['ratio']:5.1f}x  "
-              + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
+    if run_arch:
+        print("\n=== Generating architecture diagram ===")
+        fig_mlp_architecture()
 
-    print("\nAll MLP figures generated in images/")
+    hash_results = None
+    if run_hash:
+        print("\n=== Training Hash models for comparison figures ===")
+        hash_results = fig_mlp_comparison(img_np)
+        print("\n\n=== Hash Summary ===")
+        for r in hash_results:
+            print(f"{r['label']:50s}  "
+                  f"{r['params']:>8,} params  "
+                  f"{r['ratio']:5.1f}x  "
+                  + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
+
+    if run_latent:
+        print("\n=== Training Latent vs Hash comparison ===")
+        latent_results = fig_latent_vs_hash(img_np)
+        print("\n\n=== Latent vs Hash Summary ===")
+        for method, r in latent_results.items():
+            print(f"{method:10s}  "
+                  f"{r['params']:>8,} params  "
+                  f"{r['ratio']:5.1f}x  "
+                  + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
+
+    print("\nAll figures generated in images/")
