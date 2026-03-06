@@ -185,7 +185,7 @@ tinyMLP takes a radically different approach: train a small MLP (multi-layer per
 input: (x, y)  →  MLP  →  output: (r, g, b)
 ```
 
-The "compressed file" is just the **network weights**. A 38K-parameter network weighs ~152KB — for a 512×512 image that's **5× compression** with no block artifacts.
+The "compressed file" is just the **network weights**. A 39K-parameter network weighs ~152KB — for a 512×512 image (768KB) that's **5× compression** with no block artifacts.
 
 | What's stored | Block compression (tinyBC) | Neural compression (tinyMLP) |
 |---|---|---|
@@ -195,38 +195,58 @@ The "compressed file" is just the **network weights**. A 38K-parameter network w
 | Artifacts | Block boundaries | Smooth, frequency-dependent blur |
 | Compression ratio | Fixed 4:1 | Tunable via model size |
 
+### Architecture
+
+<p align="center">
+  <img src="images/fig_mlp_architecture.png" alt="tinyMLP architecture" width="100%"/>
+</p>
+
+Each pixel is decoded independently: its normalized coordinate `(x, y)` is expanded by **Fourier positional encoding** into 42 features, passed through several `Linear → GELU` hidden layers, and projected to RGB via a final `Linear → Sigmoid`. No convolutions, no attention — just a lookup table implemented as a neural network.
+
 ### Fourier Features: Teaching the MLP to See Detail
 
-A naive MLP with raw `(x, y)` inputs struggles with high-frequency content (sharp edges, texture detail) — a well-known problem called **spectral bias**. The network will learn low frequencies first and may never converge on fine detail.
+A naive MLP with raw `(x, y)` inputs suffers from **spectral bias** — it learns low-frequency patterns (broad color gradients) first and converges slowly on fine edges and textures.
 
-The solution: **Fourier positional encoding**. Before feeding coordinates to the MLP, we expand them into sine and cosine waves at multiple frequencies:
+The fix: **Fourier positional encoding**. Before the MLP, we expand coordinates into a bank of sine and cosine waves at exponentially growing frequencies:
 
 ```
-(x, y) → (x, y, sin(πx), cos(πx), sin(2πx), cos(2πx), ..., sin(2^L πx), ...)
+(x, y) → (x, y,  sin(πx), cos(πx),  sin(2πx), cos(2πx),  …,  sin(2⁹πx), cos(2⁹πx), …)
 ```
 
-This transforms a 2D input into a ~42-dimensional feature vector, giving the network explicit "frequency handles" to grab onto. The parameter `L` (number of frequency bands) controls how much detail the MLP can represent.
+This gives the network 42 explicit "frequency channels" to tune independently. The hyperparameter `L` (number of bands, default 10) controls the maximum spatial frequency the model can represent.
 
 ### Interactive Demo
 
 Run `python tinyMLP.py` to watch the network learn an image in real-time:
 
 1. The window shows **Original** (left) and **MLP Reconstruction** (right) side by side.
-2. In the first seconds, you'll see a blurry, impressionistic version appear — the low frequencies.
-3. Over the next minute, edges sharpen and details emerge as the network learns higher frequencies.
-4. The status bar tracks step count, PSNR, loss, and compression ratio live.
+2. In the first seconds, a blurry impressionistic blob appears — the low-frequency component.
+3. As training proceeds, edges sharpen and textures fill in as the network captures higher frequencies.
+4. The status bar tracks step, loss, PSNR, compression ratio, and elapsed time live.
 
 <p align="center">
-  <img src="images/fig_mlp_demo.png" alt="tinyMLP interactive demo" width="100%"/>
+  <img src="images/fig_mlp_demo.png" alt="tinyMLP interactive demo screenshot" width="100%"/>
 </p>
 
-Try different model sizes to see the quality/compression tradeoff:
+### Quality vs Steps vs Model Size
 
-```bash
-python tinyMLP.py --hidden 256 --depth 4   # big model:   ~1x ratio, ~32 dB
-python tinyMLP.py --hidden 128 --depth 3   # default:     ~5x ratio, ~28 dB
-python tinyMLP.py --hidden 64  --depth 2   # tiny model: ~20x ratio, ~22 dB
-```
+The table below shows measured PSNR for three architectures at three training checkpoints, all on the same 512×512 test image:
+
+| Architecture | Params | Model size | Compression | 500 steps | 1000 steps | 2000 steps |
+|---|---|---|---|---|---|---|
+| `--hidden 64  --depth 2`  | 7,107  |  28 KB | **27.7x** | 22.4 dB | 23.8 dB | 24.3 dB |
+| `--hidden 128 --depth 3`  | 38,915 | 152 KB |  **5.1x** | 24.8 dB | 27.0 dB | 27.9 dB |
+| `--hidden 256 --depth 4`  | 209,155| 836 KB |  **0.9x** | 26.7 dB | 30.0 dB | 31.4 dB |
+
+<p align="center">
+  <img src="images/fig_mlp_comparison.png" alt="tinyMLP quality comparison grid" width="100%"/>
+</p>
+
+<p align="center">
+  <img src="images/fig_mlp_psnr_curve.png" alt="PSNR vs training steps" width="75%"/>
+</p>
+
+All three models follow the same learning dynamics: rapid early improvement as low frequencies lock in, then a long tail as details accumulate. The PSNR curves flatten past ~1500 steps, which is why 2000 steps is a reasonable default.
 
 ---
 
@@ -249,13 +269,13 @@ The error maps (bottom row) use the `inferno` colormap — brighter means more e
 
 ### tinyMLP — Neural Compression
 
-| Model config | Params | Size | Ratio | PSNR (5000 steps) |
+| Model config | Params | Size | Ratio | PSNR @ 2000 steps |
 |---|---|---|---|---|
-| `--hidden 256 --depth 4` | 209K | 836KB | ~1x | ~32 dB |
-| `--hidden 128 --depth 3` (default) | 39K | 152KB | ~5x | ~28 dB |
-| `--hidden 64 --depth 2` | 9K | 38KB | ~20x | ~22 dB |
+| `--hidden 256 --depth 4` | 209K | 836 KB | 0.9x | **31.4 dB** |
+| `--hidden 128 --depth 3` (default) | 39K | 152 KB | 5.1x | **27.9 dB** |
+| `--hidden 64 --depth 2` | 7K | 28 KB | 27.7x | **24.3 dB** |
 
-Neural compression trades decoding speed for a completely different artifact profile — smooth, organic degradation rather than blocky boundaries.
+Neural compression trades decoding speed for a completely different artifact profile: smooth, organic degradation rather than blocky boundaries. The quality/compression tradeoff is continuously tunable via `--hidden` and `--depth`.
 
 ---
 
@@ -282,13 +302,14 @@ A self-contained PyTorch script: `FourierFeatures` positional encoding → `Imag
 
 ```
 tinyASTC/
-├── tinybc.slang        # GPU compute shader (block compressor)
-├── tinybc.py           # BC7 driver script
-├── tinyMLP.py          # Neural image compression with live visualization
-├── sample.jpg          # Test input image
-├── generate_figures.py # Generate README figures
-├── images/             # Generated figures
-└── LICENSE             # MIT
+├── tinybc.slang             # GPU compute shader (block compressor)
+├── tinybc.py                # BC7 driver script
+├── tinyMLP.py               # Neural image compression with live visualization
+├── sample.jpg               # Test input image
+├── generate_figures.py      # Generate tinyBC educational figures
+├── generate_mlp_figures.py  # Generate tinyMLP architecture + comparison figures
+├── images/                  # All generated figures
+└── LICENSE                  # MIT
 ```
 
 ---
