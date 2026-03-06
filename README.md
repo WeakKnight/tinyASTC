@@ -9,8 +9,8 @@ This repo contains two tiny, self-contained texture compressors you can read in 
 | Approach | Classic block compression (BC7 Mode 6) | Neural image compression (MLP) |
 | Core idea | 2 endpoint colors + 16 weights per 4×4 block | Network weights memorize the entire image |
 | Runs on | GPU via [Slang](https://shader-slang.com/) compute shader | GPU via PyTorch |
-| PSNR | ~40 dB | ~28 dB @ 5x compression |
-| Compression | 4:1 (fixed) | Tunable (3–12x) |
+| PSNR | ~40 dB | ~39 dB @ 2x compression |
+| Compression | 4:1 (fixed) | Tunable (2–16x) |
 | Interactive | — | Real-time training visualization |
 
 <p align="center">
@@ -32,7 +32,7 @@ This repo contains two tiny, self-contained texture compressors you can read in 
   - [The Pipeline](#the-full-pipeline)
 - [tinyMLP: Neural Image Compression](#tinymlp-neural-image-compression)
   - [The Idea](#the-idea)
-  - [Fourier Features](#fourier-features-teaching-the-mlp-to-see-detail)
+  - [Architecture: Hash Encoding + SIREN](#architecture-hash-encoding--siren)
   - [Interactive Demo](#interactive-demo)
 - [Results](#results)
 - [Code Walkthrough](#code-walkthrough)
@@ -65,10 +65,10 @@ pip install torch opencv-python
 ```
 
 ```bash
-python tinyMLP.py                          # train on sample.jpg, watch it learn
-python tinyMLP.py -i photo.png             # custom input
-python tinyMLP.py --hidden 64 --depth 2    # smaller model = higher compression
-python tinyMLP.py --save model.pth         # save trained weights
+python tinyMLP.py                                    # train on sample.jpg, watch it learn
+python tinyMLP.py -i photo.png                       # custom input
+python tinyMLP.py --log2_T 10 --hidden 32 --depth 1  # tiny model, ~16x compression
+python tinyMLP.py --save model.pth                   # save trained weights
 ```
 
 **Controls:** `Q`/`ESC` quit, `Space` pause/resume, `S` save snapshot.
@@ -185,7 +185,7 @@ tinyMLP takes a radically different approach: train a small MLP (multi-layer per
 input: (x, y)  →  MLP  →  output: (r, g, b)
 ```
 
-The "compressed file" is just the **network weights**. A 39K-parameter network weighs ~152KB — for a 512×512 image (768KB) that's **5× compression** with no block artifacts.
+The "compressed file" is just the **network weights**. A 101K-parameter network weighs ~400KB — for a 512×512 image (768KB) that's **2× compression** achieving ~39 dB PSNR with no block artifacts.
 
 | What's stored | Block compression (tinyBC) | Neural compression (tinyMLP) |
 |---|---|---|
@@ -195,33 +195,37 @@ The "compressed file" is just the **network weights**. A 39K-parameter network w
 | Artifacts | Block boundaries | Smooth, frequency-dependent blur |
 | Compression ratio | Fixed 4:1 | Tunable via model size |
 
-### Architecture
+### Architecture: Hash Encoding + SIREN
 
 <p align="center">
   <img src="images/fig_mlp_architecture.png" alt="tinyMLP architecture" width="100%"/>
 </p>
 
-Each pixel is decoded independently: its normalized coordinate `(x, y)` is expanded by **Fourier positional encoding** into 42 features, passed through several `Linear → GELU` hidden layers, and projected to RGB via a final `Linear → Sigmoid`. No convolutions, no attention — just a lookup table implemented as a neural network.
+tinyMLP uses two modern components that, combined, dramatically outperform the naive Fourier+GELU approach:
 
-### Fourier Features: Teaching the MLP to See Detail
-
-A naive MLP with raw `(x, y)` inputs suffers from **spectral bias** — it learns low-frequency patterns (broad color gradients) first and converges slowly on fine edges and textures.
-
-The fix: **Fourier positional encoding**. Before the MLP, we expand coordinates into a bank of sine and cosine waves at exponentially growing frequencies:
+**Multi-resolution Hash Encoding** (Müller et al. 2022, Instant-NGP):  
+For each coordinate `(x, y)`, we query L=16 spatial grids at geometrically spaced resolutions (coarse 16px → fine 512px). At each level, the 4 surrounding grid corners are looked up in a small learnable hash table and bilinearly interpolated. The 16 interpolated feature vectors are concatenated into a 32-dim descriptor. This is fast, differentiable, and inherently multi-scale — coarse levels capture global structure, fine levels capture detail.
 
 ```
-(x, y) → (x, y,  sin(πx), cos(πx),  sin(2πx), cos(2πx),  …,  sin(2⁹πx), cos(2⁹πx), …)
+(x, y) → [query 16 grids] → [hash lookup + bilinear interp] → 32-dim features
 ```
 
-This gives the network 42 explicit "frequency channels" to tune independently. The hyperparameter `L` (number of bands, default 10) controls the maximum spatial frequency the model can represent.
+**SIREN decoder** (Sitzmann et al. 2020):  
+The 32 hash features are decoded by 2 hidden layers using `sin(ω₀ · Wx + b)` activations rather than ReLU/GELU. Sinusoidal activations are theoretically well-suited for representing continuous signals and their derivatives — they avoid the spectral bias that makes ReLU networks converge slowly on high-frequency content.
+
+```
+32 features → [sin(ω₀·Wx)] × depth → Linear → Sigmoid → (r, g, b)
+```
+
+**Two separate learning rates** ensure stable training: the hash tables update fast (`lr=3e-2`), the SIREN decoder updates slowly (`lr=1e-3`).
 
 ### Interactive Demo
 
 Run `python tinyMLP.py` to watch the network learn an image in real-time:
 
 1. The window shows **Original** (left) and **MLP Reconstruction** (right) side by side.
-2. In the first seconds, a blurry impressionistic blob appears — the low-frequency component.
-3. As training proceeds, edges sharpen and textures fill in as the network captures higher frequencies.
+2. Within the first seconds, a clean low-frequency image appears — hash tables learn the broad structure fast.
+3. Within 1–2 minutes, fine-grained texture and edges snap into focus.
 4. The status bar tracks step, loss, PSNR, compression ratio, and elapsed time live.
 
 <p align="center">
@@ -230,13 +234,15 @@ Run `python tinyMLP.py` to watch the network learn an image in real-time:
 
 ### Quality vs Steps vs Model Size
 
-The table below shows measured PSNR for three architectures at three training checkpoints, all on the same 512×512 test image:
+The table below shows measured PSNR for three architectures at three checkpoints on the 512×512 test image:
 
-| Architecture | Params | Model size | Compression | 500 steps | 1000 steps | 2000 steps |
+| Architecture | Params | Size | Compression | 500 steps | 2000 steps | 5000 steps |
 |---|---|---|---|---|---|---|
-| `--hidden 64  --depth 2`  | 7,107  |  28 KB | **27.7x** | 22.4 dB | 23.8 dB | 24.3 dB |
-| `--hidden 128 --depth 3`  | 38,915 | 152 KB |  **5.1x** | 24.8 dB | 27.0 dB | 27.9 dB |
-| `--hidden 256 --depth 4`  | 209,155| 836 KB |  **0.9x** | 26.7 dB | 30.0 dB | 31.4 dB |
+| Tiny `--log2_T 10 --hidden 32 --depth 1` | 12,317 | 48 KB | **16x** | 25.6 dB | 27.0 dB | 27.5 dB |
+| Default `--log2_T 12 --hidden 64 --depth 2` | 101,399 | 397 KB | **1.9x** | 34.8 dB | 37.9 dB | **39.4 dB** |
+| Large `--log2_T 14 --hidden 128 --depth 3` | 322,145 | 1.26 MB | 0.6x | 39.4 dB | 43.4 dB | **46.0 dB** |
+
+Compare to the old Fourier+GELU baseline: Default config went from 27.9 dB → **39.4 dB** (+11.5 dB), and Tiny from 24.3 dB → **27.5 dB** (+3.2 dB).
 
 <p align="center">
   <img src="images/fig_mlp_comparison.png" alt="tinyMLP quality comparison grid" width="100%"/>
@@ -246,7 +252,7 @@ The table below shows measured PSNR for three architectures at three training ch
   <img src="images/fig_mlp_psnr_curve.png" alt="PSNR vs training steps" width="75%"/>
 </p>
 
-All three models follow the same learning dynamics: rapid early improvement as low frequencies lock in, then a long tail as details accumulate. The PSNR curves flatten past ~1500 steps, which is why 2000 steps is a reasonable default.
+The hash encoding enables rapid early convergence — the Default config already hits 34.8 dB at step 500. The PSNR curves still haven't fully flattened at 5000 steps, so more training continues to help.
 
 ---
 
@@ -267,15 +273,15 @@ The Nelder-Mead refinement adds ~1.6 dB PSNR — a meaningful improvement, espec
 
 The error maps (bottom row) use the `inferno` colormap — brighter means more error. Notice how the Nelder-Mead version has fewer bright spots, especially around the grille bars and headlight edges where color variation is highest.
 
-### tinyMLP — Neural Compression
+### tinyMLP — Neural Compression (Hash Encoding + SIREN)
 
-| Model config | Params | Size | Ratio | PSNR @ 2000 steps |
+| Model | Params | Size | Compression | PSNR @ 5000 steps |
 |---|---|---|---|---|
-| `--hidden 256 --depth 4` | 209K | 836 KB | 0.9x | **31.4 dB** |
-| `--hidden 128 --depth 3` (default) | 39K | 152 KB | 5.1x | **27.9 dB** |
-| `--hidden 64 --depth 2` | 7K | 28 KB | 27.7x | **24.3 dB** |
+| Large `--log2_T 14 --hidden 128 --depth 3` | 322K | 1.26 MB | 0.6x | **46.0 dB** |
+| Default `--log2_T 12 --hidden 64 --depth 2` | 101K | 397 KB | 1.9x | **39.4 dB** |
+| Tiny `--log2_T 10 --hidden 32 --depth 1` | 12K | 48 KB | 16x | **27.5 dB** |
 
-Neural compression trades decoding speed for a completely different artifact profile: smooth, organic degradation rather than blocky boundaries. The quality/compression tradeoff is continuously tunable via `--hidden` and `--depth`.
+Switching from Fourier+GELU to Hash Encoding+SIREN boosted Default config by **+11.5 dB PSNR**. Neural compression still trades decoding throughput for smooth, artifact-free quality — but at these PSNR levels the reconstructions are visually nearly indistinguishable from the original.
 
 ---
 
@@ -296,9 +302,15 @@ Neural compression trades decoding speed for a completely different artifact pro
 
 Loads the input texture via `sgl.TextureLoader`, creates an output texture, dispatches the `encoder` kernel over all 4×4 tiles, and computes PSNR.
 
-### `tinyMLP.py` — Neural Compressor (~200 lines)
+### `tinyMLP.py` — Neural Compressor (~280 lines)
 
-A self-contained PyTorch script: `FourierFeatures` positional encoding → `ImageMLP` network → Adam training loop with cosine LR schedule → real-time OpenCV/matplotlib visualization.
+| Class / function | What it does |
+|---|---|
+| `HashEncoding` | Multi-resolution hash tables; bilinear interp + spatial hash lookup at 16 resolutions |
+| `SirenLayer` | `sin(ω₀ · Wx + b)` with SIREN weight initialization for stable deep networks |
+| `ImageMLP` | Combines `HashEncoding` → `SirenLayer` stack → `Linear + Sigmoid` head |
+| `render_full` | Chunked full-image forward pass (avoids OOM on large images) |
+| `main` | Arg parsing, dual-LR Adam optimizer, cosine LR schedule, OpenCV/mpl display loop |
 
 ```
 tinyASTC/
