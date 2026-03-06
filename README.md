@@ -9,9 +9,9 @@ This repo contains two tiny, self-contained texture compressors you can read in 
 | Approach | Classic block compression (BC7 Mode 6) | Neural: multi-res hash tables + SIREN | Neural: dense latent texture grid + SIREN |
 | Core idea | 2 endpoint colors + 16 weights per 4×4 block | Hash lookup → 32 features → decode | Bilinear-sampled 2D grid → 32 features → decode |
 | Runs on | GPU via [Slang](https://shader-slang.com/) compute shader | GPU via PyTorch | GPU via PyTorch |
-| PSNR | ~40 dB | ~39.4 dB @ 1.9x | ~37.8 dB @ 1.4x |
-| Compression | 4:1 (fixed) | Tunable (2–16x) | Tunable via `--scale` and `--channels` |
-| Two-stage | — | — | Latent grid → JPEG for extra savings |
+| PSNR | ~40 dB | ~39.5 dB | ~37.6 dB (two-scale + QAT) |
+| Stage-1 ratio | 4:1 (fixed) | 1.9× (default) | **7.2×** (uint8 grids + fp16 decoder) |
+| Stage-2 ratio | — | — | **26.9×** (+ JPEG compression of uint8 latent) |
 | Interactive | — | Real-time visualization | Real-time + optional latent panel |
 
 <p align="center">
@@ -78,10 +78,13 @@ python tinyMLP.py --save model.pth                   # save trained weights
 ### tinyLatent — Neural Compression (Latent Texture)
 
 ```bash
-python tinyLatent.py                          # train on sample.png (default)
-python tinyLatent.py --vis_latent             # show latent grid evolution in 3rd panel
-python tinyLatent.py --scale 4 --channels 16  # finer grid, fewer channels
-python tinyLatent.py --save_latent lat.npy    # save latent as float16 (compressed artifact)
+python tinyLatent.py                                          # single-scale (default)
+python tinyLatent.py --ch_lo 16 --ch_hi 2                    # two-scale (~104K params)
+python tinyLatent.py --ch_lo 16 --ch_hi 2 --qat_bits 8       # two-scale + QAT int8
+python tinyLatent.py --activation gelu                        # experiment: GELU decoder
+python tinyLatent.py --vis_latent                             # show latent in 3rd panel
+python tinyLatent.py --ch_lo 16 --ch_hi 2 --qat_bits 8 \
+    --save_latent latent.npz                                  # save uint8 artifact
 ```
 
 ---
@@ -247,19 +250,64 @@ A learnable parameter tensor of shape `C × (H/scale) × (W/scale)` (e.g. `32 ×
 - **The grid can be saved as float16 `.npy`** and further compressed with standard image codecs (JPEG, PNG), enabling true two-stage compression.
 - **No hash collisions** — every feature occupies an explicit spatial slot. This trades capacity for interpretability: you can literally visualise what the network remembers.
 
+#### Two-Scale Latent
+
+The single-scale latent's weakness — no multi-resolution structure — can be addressed by adding a second, finer grid, directly mirroring [RTXNTC](https://github.com/NVIDIA-RTX/RTXNTC)'s dual-resolution latent shape:
+
+```
+Lo grid  (ch_lo channels, scale_lo=8 → 64×64)   — global structure
+Hi grid  (ch_hi channels, scale_hi=4 → 128×128)  — fine detail
+         ↓ concat → 32-dim total → SIREN decoder (unchanged)
+```
+
+```bash
+python tinyLatent.py --ch_lo 16 --ch_hi 2   # two-scale, ~104K params
+```
+
+#### Quantization-Aware Training (QAT)
+
+With `--qat_bits 8`, the latent values are **fake-quantised** during training using a Straight-Through Estimator (STE): the decoder learns to tolerate discrete integer values, so at save time the latent is stored as real `uint8`. This is exactly what JPEG and PNG expect — making the two-stage compression path far more efficient.
+
+```bash
+python tinyLatent.py --ch_lo 16 --ch_hi 2 --qat_bits 8   # QAT int8
+python tinyLatent.py --ch_lo 16 --ch_hi 2 --qat_bits 8 --save_latent latent.npz
+# latent.npz contains per-channel uint8 data + float32 min/max metadata
+```
+
+The STE trick: in the forward pass, values are rounded to 256 levels per channel. In the backward pass, gradients flow through the rounding as if it were identity — so standard Adam can still train through the quantisation.
+
+<p align="center">
+  <img src="images/fig_latent_architecture.png" alt="tinyLatent two-scale + QAT architecture" width="100%"/>
+</p>
+
 #### Orthogonal Comparison
 
-Both models use the same `hidden=64, depth=2` SIREN decoder and are trained for the same number of steps on the same lossless `sample.png`:
+All four variants use the same `hidden=64, depth=2` SIREN decoder, trained for the same steps on lossless `sample.png`:
 
-| Encoder | Params | @500 steps | @2000 steps | @5000 steps |
-|---|---|---|---|---|
-| Hash Default (`log2_T=12`) | 101,399 | 35.0 dB | 37.7 dB | **39.4 dB** |
-| Latent Default (`scale=8, ch=32`) | 137,539 | 31.3 dB | 35.8 dB | **37.8 dB** |
+| Encoder | Params | Storage (stage-1) | @500 steps | @2000 steps | @5000 steps |
+|---|---|---|---|---|---|
+| Hash Default (`log2_T=12`) | 101,399 | 397 KB fp32 (1.9×) | 34.9 dB | 37.9 dB | **39.5 dB** |
+| Latent Single-scale (`ch=32, scale=8`) | 137,539 | 550 KB fp32 (1.4×) | 30.4 dB | 35.3 dB | 37.5 dB |
+| Latent Two-scale (`ch_lo=16/s8 + ch_hi=2/s4`) | 103,875 | 185 KB fp16 (4.2×) | 32.0 dB | 35.9 dB | 37.7 dB |
+| **Two-scale + QAT int8** | 103,875 | **28.6 KB** (7.2× → **26.9×** w/ JPEG) | 32.0 dB | 36.0 dB | **37.6 dB** |
 
 **Key observations:**
-- Hash encoding converges significantly faster (35.0 vs 31.3 dB at step 500), owing to its multi-resolution design: coarse levels learn broad structure instantly while fine levels fill in detail.
-- Latent texture closes the gap over time but remains ~1–2 dB behind at equal step count for matched parameter budget.
-- The latent grid's advantage: it is a **concrete, spatial artifact** — you can visualise, quantise, and compress it with existing tools.
+- Hash encoding still converges fastest owing to its 16-level multi-scale design.
+- Two-scale latent outperforms single-scale by +0.2 dB at 5000 steps while using **25% fewer parameters** (104K vs 138K) — multi-resolution structure helps even with just two levels.
+- **QAT int8** costs only ~0.2 dB vs non-quantised but unlocks a two-stage path: uint8 grids compress to 17.7 KB under JPEG, and together with the 10.9 KB fp16 decoder the total artifact is **28.6 KB — 26.9× smaller** than the 768 KB raw image.
+- The latent grid's unique advantage remains: it is a **concrete, spatial artifact** — visualisable, quantisable, and compressible with standard image codecs.
+
+#### Decoder Activation: SIREN vs GELU vs SiLU
+
+Although bilinear `F.grid_sample` produces spatially smooth feature vectors, swapping SIREN for GELU or SiLU costs **~5 dB** at the same budget. Sinusoidal activations provide a far richer non-linear basis for the 18D→RGB mapping than piecewise-smooth activations can with only 2 layers and 64 hidden units. Use `--activation gelu` for experiments where training stability matters more than peak quality.
+
+| Decoder | @500 steps | @2000 steps | @5000 steps |
+|---|---|---|---|
+| SIREN (default) | 32.0 dB | 36.1 dB | **38.0 dB** |
+| GELU MLP | 28.5 dB | 31.3 dB | 32.8 dB |
+| SiLU MLP | 28.0 dB | 31.0 dB | 32.1 dB |
+
+*(Two-scale latent, `ch_lo=16 + ch_hi=2`, `hidden=64 depth=2`, 5000 steps)*
 
 <p align="center">
   <img src="images/fig_latent_vs_hash_grid.png" alt="Hash vs Latent quality grid" width="100%"/>
@@ -281,16 +329,28 @@ The latent channel preview shows a blurry, compressed-looking version of the sce
 
 #### Two-Stage Compression Potential
 
-Because the latent grid is a regular float array, you can compress it a second time:
+Because the latent grid is a regular array, it can be compressed a second time with standard image codecs:
 
-```python
-# Save latent as float16
+```bash
+# fp16 path (no QAT) — save as float16 .npy
 python tinyLatent.py --save_latent latent.npy
-# Latent (.npy fp16): ~256 KB for 32×64×64
-# Further compress with JPEG (Q=85): typically ~30–60 KB additional savings
+# Latent fp16 (.npy): ~256 KB for 32×64×64; further JPEG: ~30–50 KB savings
+
+# uint8 path (QAT) — save as per-channel uint8 .npz  ← much more compressible
+python tinyLatent.py --ch_lo 16 --ch_hi 2 --qat_bits 8 --save_latent latent.npz
+# latent.npz: ~100 KB; JPEG of uint8 latent: typically 3–5× smaller than fp16
 ```
 
-For a 512×512 image (~768 KB uncompressed), combining float16 latent + fp16 decoder weights + JPEG compression of the latent grid can push effective ratios beyond 5×, at the cost of some reconstruction quality from quantisation artefacts.
+For the default two-scale + QAT int8 configuration on a 512×512 image (768 KB uncompressed), the breakdown is:
+
+| Component | Raw size | After JPEG Q=85 |
+|---|---|---|
+| Lo grid uint8 (16×64×64) | 64.0 KB | **12.2 KB** (5.2×) |
+| Hi grid uint8 (2×128×128) | 32.0 KB | **5.5 KB** (5.9×) |
+| Decoder fp16 | 10.9 KB | 10.9 KB (no codec needed) |
+| **Total** | 96 KB (7.2× stage-1) | **28.6 KB (26.9× stage-2)** |
+
+The uint8 latent grids are spatially smooth (bilinear sampling enforces spatial coherence), so JPEG achieves 5â6× compression on them — far better than on random float data. This is the same two-stage architecture used by [RTXNTC](https://github.com/NVIDIA-RTX/RTXNTC) in production.
 
 ### Interactive Demo
 
@@ -360,12 +420,14 @@ Switching from Fourier+GELU to Hash Encoding+SIREN boosted Default config by **+
 
 Same SIREN decoder as tinyMLP (identical `hidden=64, depth=2`). Only the encoder changes — sparse hash tables → dense bilinear-sampled grid.
 
-| Encoder | Params | Size | Compression | 500 steps | 2000 steps | 5000 steps |
-|---|---|---|---|---|---|---|
-| Hash Default (`log2_T=12`) | 101,399 | 397 KB | **1.9x** | 35.0 dB | 37.7 dB | **39.4 dB** |
-| Latent Default (`scale=8, ch=32`) | 137,539 | 539 KB | **1.4x** | 31.3 dB | 35.8 dB | **37.8 dB** |
+| Encoder | Params | Compression | 500 steps | 2000 steps | 5000 steps |
+|---|---|---|---|---|---|
+| Hash Default (`log2_T=12`) | 101,399 | 1.9× (stage-1) | 34.9 dB | 37.9 dB | **39.5 dB** |
+| Latent Single-scale (`ch=32, scale=8`) | 137,539 | 1.4× (stage-1) | 30.4 dB | 35.3 dB | 37.5 dB |
+| Latent Two-scale (`ch_lo=16/s8 + ch_hi=2/s4`) | 103,875 | 4.2× (stage-1) | 32.0 dB | 35.9 dB | **37.7 dB** |
+| Two-scale + QAT int8 (`--qat_bits 8`) | 103,875 | **7.2×** stage-1 / **26.9×** stage-2 | 32.0 dB | 36.0 dB | **37.6 dB** |
 
-Hash encoding converges faster and reaches higher PSNR at equal step count. The latent texture's advantage is its spatial interpretability and two-stage compression potential.
+Two-scale latent matches Hash Default's parameter budget and narrows the PSNR gap vs single-scale while using fewer parameters. QAT int8 adds negligible quality cost (−0.2 dB) but unlocks a powerful two-stage compression path: the uint8 grids JPEG-compress to 28.6 KB total — a **26.9×** compression ratio on a 512×512 image at 37.6 dB. See the two-stage compression section above for the full breakdown.
 
 ---
 
@@ -396,14 +458,16 @@ Loads the input texture via `sgl.TextureLoader`, creates an output texture, disp
 | `render_full` | Chunked full-image forward pass (avoids OOM on large images) |
 | `main` | Arg parsing, dual-LR Adam optimizer, cosine LR schedule, OpenCV/mpl display loop |
 
-### `tinyLatent.py` — Latent Texture Neural Compressor (~260 lines)
+### `tinyLatent.py` — Latent Texture Neural Compressor (~350 lines)
 
 | Class / function | What it does |
 |---|---|
-| `LatentTexture` | Dense `C × (H/scale) × (W/scale)` parameter grid; bilinear `F.grid_sample` lookup |
-| `LatentImageMLP` | Combines `LatentTexture` → `SirenLayer` stack → `Linear + Sigmoid` (same decoder as tinyMLP) |
-| `estimate_jpeg_size` | Estimates compressed latent size via PIL JPEG encoding to gauge two-stage compression potential |
-| `main` | Single-LR Adam, cosine schedule, optional `--vis_latent` 3rd panel, `--save_latent` float16 export |
+| `quantize_ste_perchannel` | Per-channel fake quantisation with Straight-Through Estimator; enables QAT training |
+| `save_latent_uint8` | Saves a float32 latent as per-channel uint8 `.npz` (actual compressed artifact for QAT mode) |
+| `LatentTexture` | Two-scale dense grids (`lo` + optional `hi`); bilinear `F.grid_sample`; QAT applied in `forward` via `set_step` |
+| `LatentImageMLP` | Combines `LatentTexture` → `SirenLayer` stack → `Linear + Sigmoid` (identical decoder to tinyMLP) |
+| `estimate_jpeg_size` / `estimate_jpeg_size_uint8` | Estimate JPEG-compressed latent size for two-stage compression potential reporting |
+| `main` | Single-LR Adam, cosine schedule, `--vis_latent` 3rd panel, `--save_latent` fp16/uint8 export |
 
 ### `generate_mlp_figures.py` — Figure Generator
 

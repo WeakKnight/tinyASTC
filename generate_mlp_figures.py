@@ -27,7 +27,7 @@ from PIL import Image
 local_dir = pathlib.Path(__file__).parent.absolute()
 sys.path.insert(0, str(local_dir))
 from tinyMLP import HashEncoding, SirenLayer, ImageMLP, render_full
-from tinyLatent import LatentTexture, LatentImageMLP
+from tinyLatent import LatentTexture, LatentImageMLP, estimate_jpeg_size, estimate_jpeg_size_uint8
 
 import os
 os.makedirs('images', exist_ok=True)
@@ -188,6 +188,225 @@ def fig_mlp_architecture():
                 facecolor='#12121E', edgecolor='none')
     plt.close()
     print("Generated: images/fig_mlp_architecture.png")
+
+
+# ====================================================================
+# Latent Texture architecture diagram — Two-Scale + QAT
+# ====================================================================
+def fig_latent_architecture():
+    fig, ax = plt.subplots(figsize=(20, 8), facecolor='#12121E')
+    ax.set_xlim(0, 20)
+    ax.set_ylim(-0.2, 8.2)
+    ax.axis('off')
+    ax.set_facecolor('#12121E')
+
+    BG     = '#12121E'
+    C_IN   = '#4FC3F7'
+    C_LO   = '#FF8A65'
+    C_HI   = '#FFAB40'
+    C_QAT  = '#EF5350'
+    C_FEAT = '#FFD54F'
+    C_SIREN= '#81C784'
+    C_OUT  = '#CE93D8'
+    C_COMP = '#4DB6AC'
+    C_ARR  = '#78909C'
+    C_TXT  = '#ECEFF1'
+    C_DIM  = '#90A4AE'
+
+    def box(cx, cy, w, h, fc, ec, lw=1.8, alpha=0.18, radius=0.18):
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (cx-w/2, cy-h/2), w, h,
+            boxstyle=f'round,pad={radius}',
+            facecolor=fc, edgecolor=ec,
+            linewidth=lw, alpha=alpha, zorder=4))
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (cx-w/2, cy-h/2), w, h,
+            boxstyle=f'round,pad={radius}',
+            facecolor='none', edgecolor=ec,
+            linewidth=lw, zorder=5))
+
+    def txt(x, y, s, color=C_TXT, fs=9, fw='normal', ha='center', va='center', **kw):
+        ax.text(x, y, s, color=color, fontsize=fs, fontweight=fw,
+                ha=ha, va=va, zorder=6, **kw)
+
+    def arrow(x0, y0, x1, y1, color=C_ARR, lw=1.8):
+        ax.annotate('', xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(arrowstyle='->', lw=lw,
+                                    color=color, mutation_scale=14), zorder=7)
+
+    def grid_mini(cx, cy, n, cs, c):
+        for i in range(n+1):
+            ax.plot([cx, cx+n*cs], [cy+i*cs, cy+i*cs],
+                    color=c, lw=0.5, alpha=0.55, zorder=3)
+            ax.plot([cx+i*cs, cx+i*cs], [cy, cy+n*cs],
+                    color=c, lw=0.5, alpha=0.55, zorder=3)
+        qx, qy = n//2, n//2
+        ax.add_patch(mpatches.Rectangle(
+            (cx+qx*cs, cy+qy*cs), 2*cs, 2*cs,
+            facecolor=c, alpha=0.45, zorder=4))
+        for dx, dy in [(0,0),(1,0),(0,1),(1,1)]:
+            ax.plot(cx+(qx+dx)*cs, cy+(qy+dy)*cs, 'o',
+                    color=C_FEAT, ms=4.5, zorder=6)
+
+    # ── Input ─────────────────────────────────────────────────────────
+    box(1.1, 4.5, 1.6, 1.8, C_IN, C_IN)
+    txt(1.1, 5.0, 'Input', color=C_IN, fs=11, fw='bold')
+    txt(1.1, 4.5, '(x, y)', color=C_TXT, fs=10, fontfamily='monospace')
+    txt(1.1, 4.0, 'coords ∈ [−1,1]', color=C_DIM, fs=7.5)
+    arrow(1.9, 4.5, 2.65, 4.5)
+
+    # ── Two-Scale Latent Texture outer box ───────────────────────────
+    box(6.2, 4.5, 7.2, 7.4, C_LO, C_LO, alpha=0.07, radius=0.25)
+    txt(6.2, 8.1, 'Two-Scale Latent Texture', color=C_LO, fs=11, fw='bold')
+    txt(6.2, 7.75, 'dense 2-D grids, bilinear F.grid_sample',
+        color=C_DIM, fs=8, fontstyle='italic')
+
+    # ── Lo grid ───────────────────────────────────────────────────────
+    box(3.8, 5.8, 2.2, 3.6, C_LO, C_LO, alpha=0.16)
+    txt(3.8, 7.4, 'Lo grid', color=C_LO, fs=10, fw='bold')
+    txt(3.8, 7.05, '16 ch × 64×64', color=C_TXT, fs=8.5, fontfamily='monospace')
+    grid_mini(2.95, 5.15, 8, 0.09, C_LO)
+    txt(3.8, 5.0, 'F.grid_sample\n(bilinear)', color=C_DIM, fs=7.5, fontstyle='italic')
+
+    # QAT badge on Lo grid
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (2.7, 4.55), 2.2, 0.38,
+        boxstyle='round,pad=0.06',
+        facecolor=C_QAT, edgecolor='none', alpha=0.85, zorder=8))
+    txt(3.8, 4.74, 'QAT  int8  (STE)', color='white', fs=8.0, fw='bold')
+
+    # ── Hi grid ───────────────────────────────────────────────────────
+    box(7.0, 5.5, 2.2, 3.0, C_HI, C_HI, alpha=0.16)
+    txt(7.0, 6.85, 'Hi grid', color=C_HI, fs=10, fw='bold')
+    txt(7.0, 6.5, '2 ch × 128×128', color=C_TXT, fs=8.5, fontfamily='monospace')
+    grid_mini(6.1, 4.95, 10, 0.07, C_HI)
+    txt(7.0, 4.78, 'F.grid_sample\n(bilinear)', color=C_DIM, fs=7.5, fontstyle='italic')
+
+    # QAT badge on Hi grid
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (5.9, 4.35), 2.2, 0.38,
+        boxstyle='round,pad=0.06',
+        facecolor=C_QAT, edgecolor='none', alpha=0.85, zorder=8))
+    txt(7.0, 4.54, 'QAT  int8  (STE)', color='white', fs=8.0, fw='bold')
+
+    # arrows from input to grids
+    arrow(2.65, 4.5, 2.75, 5.8)
+    arrow(2.65, 4.5, 5.9, 5.5)
+
+    # ── Concat ────────────────────────────────────────────────────────
+    arrow(4.9, 5.8, 8.55, 4.9)
+    arrow(8.1, 5.5, 8.55, 4.9)
+
+    box(9.1, 4.5, 1.1, 4.2, C_FEAT, C_FEAT, alpha=0.12)
+    txt(9.1, 6.5, 'Concat', color=C_FEAT, fs=10, fw='bold')
+    txt(9.1, 6.1, 'features', color=C_FEAT, fs=10, fw='bold')
+    n_shown = 9
+    stripe_h = 3.3 / n_shown
+    for i in range(n_shown):
+        alpha = 0.12 + 0.5 * i / n_shown
+        fc = C_LO if i < 8 else C_HI
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (8.57, 5.8-(i+1)*stripe_h), 1.0, stripe_h*0.9,
+            boxstyle='round,pad=0.01',
+            facecolor=fc, alpha=alpha, zorder=5))
+        if i == 0:
+            txt(9.1, 5.8-(i+0.5)*stripe_h, 'lo ×16', color=BG, fs=5.5, fw='bold')
+        elif i == 7:
+            txt(9.1, 5.8-(i+0.5)*stripe_h, '⋮', color=BG, fs=9, fw='bold')
+        elif i == n_shown-1:
+            txt(9.1, 5.8-(i+0.5)*stripe_h, 'hi ×2', color=BG, fs=5.5, fw='bold')
+    txt(9.1, 2.4, '18 dims\n(16+2)', color=C_FEAT, fs=8.5)
+
+    arrow(9.65, 4.5, 10.4, 4.5)
+
+    # ── SIREN layers ─────────────────────────────────────────────────
+    siren_data = [
+        (11.15, 'SIREN Layer 1', '18 → 64\nsin(ω₀ · Wx)', True),
+        (12.95, 'SIREN Layer 2', '64 → 64\nsin(ω₀ · Wx)', False),
+    ]
+    for lx, title, sub, first in siren_data:
+        box(lx, 4.5, 1.5, 3.0, C_SIREN, C_SIREN, alpha=0.14 if not first else 0.20)
+        txt(lx, 5.4, title, color=C_SIREN, fs=9, fw='bold')
+        txt(lx, 4.8, sub.split('\n')[0], color=C_TXT, fs=8.0, fontfamily='monospace')
+        txt(lx, 4.2, sub.split('\n')[1], color=C_SIREN, fs=7.5, fontstyle='italic')
+        if first:
+            txt(lx, 3.7, 'ω₀ = 30', color=C_DIM, fs=7.5)
+        arrow(lx+0.75, 4.5, lx+1.6, 4.5)
+
+    # ── Output head ──────────────────────────────────────────────────
+    box(15.1, 4.5, 1.5, 2.2, C_OUT, C_OUT, alpha=0.14)
+    txt(15.1, 5.1, 'Linear', color=C_OUT, fs=10, fw='bold')
+    txt(15.1, 4.6, '+ Sigmoid', color=C_OUT, fs=10, fw='bold')
+    txt(15.1, 4.1, '64 → 3', color=C_TXT, fs=8.5, fontfamily='monospace')
+    arrow(15.85, 4.5, 16.6, 4.5)
+
+    box(17.1, 4.5, 1.0, 2.0, C_OUT, C_OUT)
+    txt(17.1, 4.9, 'RGB', color=C_OUT, fs=12, fw='bold')
+    txt(17.1, 4.35, 'pixel\ncolor', color=C_TXT, fs=8.5)
+
+    ax.annotate('MSE Loss vs\ntarget pixel',
+                xy=(17.1, 3.4), xytext=(17.1, 1.9),
+                ha='center', fontsize=8.5, color='#EF9A9A', fontweight='bold',
+                arrowprops=dict(arrowstyle='->', lw=1.8, color='#EF9A9A'), zorder=8)
+
+    # ── SIREN depth brace ────────────────────────────────────────────
+    ax.annotate('', xy=(13.7, 1.1), xytext=(10.4, 1.1),
+                arrowprops=dict(arrowstyle='<->', lw=1.5, color=C_SIREN, mutation_scale=12))
+    txt(12.05, 0.75, 'depth SIREN layers  (default: 2,  hidden: 64)', color=C_SIREN, fs=8, fontstyle='italic')
+
+    # ── Two-stage compression path ───────────────────────────────────
+    box(5.0, 1.45, 4.8, 1.7, C_COMP, C_COMP, alpha=0.08, radius=0.15)
+    txt(5.0, 2.15, 'Two-Stage Compression (at save time)', color=C_COMP, fs=9.5, fw='bold')
+
+    # Stage 1
+    box(3.6, 1.3, 1.6, 0.9, C_QAT, C_QAT, alpha=0.20)
+    txt(3.6, 1.5, 'uint8 grids', color=C_QAT, fs=8.5, fw='bold')
+    txt(3.6, 1.1, '96 KB (raw)', color=C_DIM, fs=7.5)
+    ax.annotate('', xy=(4.4, 1.3), xytext=(3.8, 4.2),
+                arrowprops=dict(arrowstyle='->', lw=1.2, color=C_QAT,
+                                connectionstyle='arc3,rad=0.25',
+                                mutation_scale=12), zorder=7)
+    txt(3.3, 2.6, 'Stage 1\nexport', color=C_QAT, fs=7, ha='center')
+
+    # Arrow stage 1 → stage 2
+    arrow(4.4, 1.3, 4.85, 1.3, color=C_COMP)
+    txt(4.62, 1.55, 'JPEG\nQ=85', color=C_COMP, fs=7.5, fontstyle='italic')
+
+    # Stage 2
+    box(5.5, 1.3, 1.5, 0.9, C_COMP, C_COMP, alpha=0.22)
+    txt(5.5, 1.55, 'JPEG grids', color=C_COMP, fs=8.5, fw='bold')
+    txt(5.5, 1.1, '17.7 KB', color=C_DIM, fs=7.5)
+
+    # Plus decoder
+    txt(6.55, 1.3, '+', color=C_TXT, fs=12, fw='bold')
+
+    box(7.3, 1.3, 1.4, 0.9, C_SIREN, C_SIREN, alpha=0.18)
+    txt(7.3, 1.55, 'decoder fp16', color=C_SIREN, fs=8, fw='bold')
+    txt(7.3, 1.1, '10.9 KB', color=C_DIM, fs=7.5)
+
+    # Equals + ratio
+    txt(8.3, 1.3, '=', color=C_TXT, fs=14, fw='bold')
+    ax.add_patch(mpatches.FancyBboxPatch(
+        (8.55, 0.9), 2.3, 0.85,
+        boxstyle='round,pad=0.1',
+        facecolor=C_COMP, edgecolor='none', alpha=0.85, zorder=8))
+    txt(9.7, 1.37, '28.6 KB total', color='white', fs=10.0, fw='bold')
+    txt(9.7, 1.0, '26.9× vs 768 KB raw  @  37.6 dB', color='white', fs=8.0)
+
+    # ── QAT STE footnote ─────────────────────────────────────────────
+    txt(1.1, 0.55,
+        'STE = Straight-Through Estimator: round(x) in forward pass, identity gradient in backward',
+        color=C_DIM, fs=7.5, ha='left')
+
+    # ── Title ────────────────────────────────────────────────────────
+    fig.suptitle(
+        'tinyLatent Architecture:  (x, y)  →  Two-Scale Latent Texture (QAT int8)  →  SIREN  →  (r, g, b)',
+        fontsize=13, fontweight='bold', color=C_TXT, y=0.99)
+
+    plt.savefig('images/fig_latent_architecture.png', dpi=150, bbox_inches='tight',
+                facecolor='#12121E', edgecolor='none')
+    plt.close()
+    print("Generated: images/fig_latent_architecture.png")
 
 
 # ====================================================================
@@ -366,10 +585,19 @@ def all_configs_results(configs, all_snaps, all_params, all_ratios, steps):
 # ====================================================================
 # Latent training helper — mirrors train_snapshots but uses LatentImageMLP
 # ====================================================================
-def train_latent_snapshots(img_np, H, W, scale, channels,
+def train_latent_snapshots(img_np, H, W,
+                           ch_lo=32, scale_lo=8,
+                           ch_hi=0,  scale_hi=4,
                            hidden=64, depth=2, omega_0=30.0,
+                           activation='gelu',
                            total_steps=5000, snapshot_steps=(500, 2000, 5000),
-                           lr=3e-3, batch=2**16):
+                           lr=3e-3, batch=2**16,
+                           qat_bits=0, qat_start=500):
+    """Train a LatentImageMLP and return PSNR snapshots + curve.
+
+    Supports single-scale (ch_hi=0), two-scale (ch_hi>0), QAT (qat_bits>0),
+    and any decoder activation ('gelu', 'silu', 'relu', 'siren').
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     gy, gx = torch.meshgrid(torch.linspace(-1, 1, H),
@@ -378,8 +606,12 @@ def train_latent_snapshots(img_np, H, W, scale, channels,
     all_colors  = torch.from_numpy(img_np).reshape(-1, 3).to(device)
     N = all_coords.shape[0]
 
-    model = LatentImageMLP(H=H, W=W, scale=scale, channels=channels,
-                           hidden=hidden, depth=depth, omega_0=omega_0).to(device)
+    model = LatentImageMLP(H=H, W=W,
+                           ch_lo=ch_lo, scale_lo=scale_lo,
+                           ch_hi=ch_hi,  scale_hi=scale_hi,
+                           hidden=hidden, depth=depth, omega_0=omega_0,
+                           activation=activation,
+                           qat_bits=qat_bits, qat_start=qat_start).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-15)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
@@ -391,6 +623,7 @@ def train_latent_snapshots(img_np, H, W, scale, channels,
 
     t0 = time.time()
     for step in range(1, total_steps + 1):
+        model.encoder.set_step(step)
         model.train()
         idx = torch.randint(0, N, (min(batch, N),), device=device)
         pred = model(all_coords[idx])
@@ -411,61 +644,123 @@ def train_latent_snapshots(img_np, H, W, scale, channels,
                 print(f"  step {step:5d}/{total_steps}  PSNR {psnr:.2f} dB  ({time.time()-t0:.1f}s)")
 
     img_bytes = H * W * 3
-    lat_params = model.encoder.latent.numel()
+    lat_np = model.encoder.lo.detach().cpu().numpy()
+    lat_params = model.encoder.latent_params
     net_params  = model.param_count - lat_params
-    latent_np   = model.encoder.latent.detach().cpu().numpy()
-    return snapshots, psnr_curve, model.param_count, img_bytes / model.size_bytes, latent_np, lat_params, net_params
+    return (snapshots, psnr_curve, model.param_count,
+            img_bytes / model.size_bytes, lat_np, lat_params, net_params)
 
 
 # ====================================================================
-# Figure: Latent vs Hash orthogonal comparison
+# Figure: Latent vs Hash orthogonal comparison  (4-row extended)
 # ====================================================================
-def fig_latent_vs_hash(img_np):
-    """Train matched-budget Hash and Latent models; produce comparison grid + curves."""
+def fig_latent_vs_hash(img_np, include_v2=True, include_v3=False):
+    """Train Hash + Latent variants; produce comparison grid + curves.
+
+    Rows (include_v2=True):
+      1. Hash Default              (101K params, SIREN decoder)
+      2. Latent Single-scale       (137K params, SIREN decoder)
+      3. Latent Two-scale          (~104K params, SIREN decoder)
+      4. Two-scale + QAT int8      (~104K params, SIREN decoder)
+
+    Extra rows (include_v3=True, decoder activation comparison on two-scale):
+      5. Two-scale + GELU decoder  (~104K params)
+      6. Two-scale + SiLU decoder  (~104K params)
+      7. Two-scale + QAT + GELU    (~104K params, quantised)
+    """
     H, W, _ = img_np.shape
     img_bytes = H * W * 3
     STEPS = [500, 2000, 5000]
 
-    # ── Default-budget Hash config ────────────────────────────────────────
-    hash_cfg_default = dict(n_levels=16, n_features=2, log2_T=12,
-                            hidden=64, depth=2)
-    # ── Matched Latent config (scale=8, channels=32 → ~same KB as Hash Default) ──
-    latent_scale_default, latent_ch_default = 8, 32
-
+    # ── Hash Default ──────────────────────────────────────────────────────────
+    hash_cfg = dict(n_levels=16, n_features=2, log2_T=12, hidden=64, depth=2)
     print("\n[Hash Default]  Training ...")
     h_snaps, h_curve, h_params, h_ratio = train_snapshots(
-        img_np, hash_cfg_default, total_steps=5000, snapshot_steps=STEPS)
+        img_np, hash_cfg, total_steps=5000, snapshot_steps=STEPS)
 
-    print("\n[Latent Default]  Training ...")
-    l_snaps, l_curve, l_params, l_ratio, latent_np, lat_p, net_p = train_latent_snapshots(
-        img_np, H, W,
-        scale=latent_scale_default, channels=latent_ch_default,
+    # ── Latent Single-scale ───────────────────────────────────────────────────
+    print("\n[Latent Single-scale  SIREN]  Training ...")
+    s_snaps, s_curve, s_params, s_ratio, s_lat, _, _ = train_latent_snapshots(
+        img_np, H, W, ch_lo=32, scale_lo=8, ch_hi=0, activation='siren',
         total_steps=5000, snapshot_steps=STEPS)
 
-    # ── Grid figure (2 rows × 4 cols) ───────────────────────────────────
-    fig, axes = plt.subplots(2, 4, figsize=(18, 9.5), facecolor='white')
+    rows      = [('Hash Default',            h_snaps, h_curve, h_params, h_ratio),
+                 ('Latent Single-scale',      s_snaps, s_curve, s_params, s_ratio)]
+    latent_np = s_lat   # used for visualization figure
+
+    if include_v2:
+        # ── Latent Two-scale SIREN (~matched budget) ──────────────────────────
+        print("\n[Latent Two-scale  SIREN]  Training ...")
+        t_snaps, t_curve, t_params, t_ratio, t_lat, _, _ = train_latent_snapshots(
+            img_np, H, W, ch_lo=16, scale_lo=8, ch_hi=2, scale_hi=4,
+            activation='siren',
+            total_steps=5000, snapshot_steps=STEPS)
+
+        # ── Two-scale + QAT int8 SIREN ────────────────────────────────────────
+        print("\n[Two-scale + QAT int8  SIREN]  Training ...")
+        q_snaps, q_curve, q_params, q_ratio, q_lat, _, _ = train_latent_snapshots(
+            img_np, H, W, ch_lo=16, scale_lo=8, ch_hi=2, scale_hi=4,
+            activation='siren',
+            total_steps=5000, snapshot_steps=STEPS,
+            qat_bits=8, qat_start=500)
+
+        rows += [('Two-scale (SIREN)',        t_snaps, t_curve, t_params, t_ratio),
+                 ('Two-scale + QAT (SIREN)',  q_snaps, q_curve, q_params, q_ratio)]
+
+    if include_v3:
+        # ── Two-scale + GELU decoder ──────────────────────────────────────────
+        print("\n[Two-scale  GELU decoder]  Training ...")
+        g_snaps, g_curve, g_params, g_ratio, g_lat, _, _ = train_latent_snapshots(
+            img_np, H, W, ch_lo=16, scale_lo=8, ch_hi=2, scale_hi=4,
+            activation='gelu',
+            total_steps=5000, snapshot_steps=STEPS)
+
+        # ── Two-scale + SiLU decoder ──────────────────────────────────────────
+        print("\n[Two-scale  SiLU decoder]  Training ...")
+        u_snaps, u_curve, u_params, u_ratio, u_lat, _, _ = train_latent_snapshots(
+            img_np, H, W, ch_lo=16, scale_lo=8, ch_hi=2, scale_hi=4,
+            activation='silu',
+            total_steps=5000, snapshot_steps=STEPS)
+
+        # ── Two-scale + QAT int8 + GELU decoder ──────────────────────────────
+        print("\n[Two-scale + QAT int8  GELU decoder]  Training ...")
+        qg_snaps, qg_curve, qg_params, qg_ratio, qg_lat, _, _ = train_latent_snapshots(
+            img_np, H, W, ch_lo=16, scale_lo=8, ch_hi=2, scale_hi=4,
+            activation='gelu',
+            total_steps=5000, snapshot_steps=STEPS,
+            qat_bits=8, qat_start=500)
+
+        rows += [('Two-scale + GELU',         g_snaps, g_curve, g_params, g_ratio),
+                 ('Two-scale + SiLU',         u_snaps, u_curve, u_params, u_ratio),
+                 ('Two-scale + QAT + GELU',   qg_snaps, qg_curve, qg_params, qg_ratio)]
+
+    n_rows = len(rows)
+
+    # ── Grid figure ───────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(n_rows, 4,
+                             figsize=(18, 4.6 * n_rows + 0.6),
+                             facecolor='white')
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
     plt.subplots_adjust(wspace=0.04, hspace=0.30)
 
-    row_labels = [
-        f'Hash Encoding\n{h_params:,} params  {h_ratio:.1f}x',
-        f'Latent Texture\n{l_params:,} params  {l_ratio:.1f}x',
-    ]
     col_labels = ['Original'] + [f'{s} steps' for s in STEPS]
     col_colors = ['#333333', '#1565C0', '#1565C0', '#1565C0']
 
     for j, (lbl, col) in enumerate(zip(col_labels, col_colors)):
-        ax = axes[0, j]
-        ax.set_title(lbl, fontsize=11.5, fontweight='bold', color=col, pad=6)
+        axes[0, j].set_title(lbl, fontsize=11.5, fontweight='bold',
+                              color=col, pad=6)
 
-    for i, (snaps, row_lbl) in enumerate(
-            [(h_snaps, row_labels[0]), (l_snaps, row_labels[1])]):
-        # Original column
+    row_colors = ['#1565C0', '#E53935', '#2E7D32', '#6A1B9A',
+                  '#00838F', '#EF6C00', '#4527A0']
+    for i, (row_label, snaps, _, params, ratio) in enumerate(rows):
         axes[i, 0].imshow(img_np)
         axes[i, 0].axis('off')
-        axes[i, 0].text(-0.04, 0.5, row_lbl,
+        lbl = f'{row_label}\n{params:,} params  {ratio:.1f}x'
+        axes[i, 0].text(-0.04, 0.5, lbl,
                         transform=axes[i, 0].transAxes,
-                        ha='right', va='center', fontsize=9, color='#333333',
-                        rotation=0, wrap=True,
+                        ha='right', va='center', fontsize=8.5,
+                        color=row_colors[i],
                         bbox=dict(boxstyle='round,pad=0.35', fc='#F5F5F5',
                                   ec='#BDBDBD', alpha=0.9))
         for j, step in enumerate(STEPS):
@@ -473,41 +768,41 @@ def fig_latent_vs_hash(img_np):
             recon, psnr = snaps[step][0], snaps[step][1]
             ax.imshow(recon)
             ax.axis('off')
-            color = '#1B5E20' if psnr >= 33 else '#2E7D32' if psnr >= 28 else '#E65100'
-            ax.set_title(f'PSNR {psnr:.1f} dB', fontsize=9.5, color=color, pad=3)
+            c = '#1B5E20' if psnr >= 33 else '#2E7D32' if psnr >= 28 else '#E65100'
+            ax.set_title(f'PSNR {psnr:.1f} dB', fontsize=9.5, color=c, pad=3)
 
-    fig.suptitle('Hash Encoding vs Latent Texture — Matched Parameter Budget  (~same KB)',
+    fig.suptitle('Hash vs Latent Variants — PSNR Quality Comparison',
                  fontsize=14, fontweight='bold', y=1.00)
     plt.savefig('images/fig_latent_vs_hash_grid.png', dpi=150,
                 bbox_inches='tight', facecolor='white')
     plt.close()
     print("\nGenerated: images/fig_latent_vs_hash_grid.png")
 
-    # ── Curve figure ─────────────────────────────────────────────────────
+    # ── Curve figure ──────────────────────────────────────────────────────────
     fig2, ax2 = plt.subplots(figsize=(10, 5.5), facecolor='white')
-    curve_data = [
-        (h_curve, '#1E88E5', f'Hash Default  ({h_params:,} params, {h_ratio:.1f}x)'),
-        (l_curve, '#E53935', f'Latent Default ({l_params:,} params, {l_ratio:.1f}x)'),
-    ]
-    for curve, color, label in curve_data:
+    linestyles = ['-', '--', '-.', ':']
+    for (row_label, _, curve, params, ratio), color, ls in zip(
+            rows, row_colors, linestyles):
         xs = [s for s, _ in curve]
         ys = [p for _, p in curve]
-        ax2.plot(xs, ys, '-', color=color, label=label, linewidth=2.2)
+        label = f'{row_label}  ({params:,} params, {ratio:.1f}x)'
+        ax2.plot(xs, ys, ls, color=color, label=label, linewidth=2.2)
         for step in STEPS:
             sy = [p for s, p in curve if s == step]
             if sy:
                 ax2.plot([step], sy, 'o', color=color, markersize=7,
                          markeredgecolor='white', markeredgewidth=1, zorder=5)
-                ax2.annotate(f'{sy[0]:.1f}',  (step, sy[0]),
+                ax2.annotate(f'{sy[0]:.1f}', (step, sy[0]),
                              textcoords='offset points', xytext=(4, 5),
-                             fontsize=8.5, color=color, fontweight='bold')
+                             fontsize=8, color=color, fontweight='bold')
 
     ax2.set_xlabel('Training Steps', fontsize=12)
     ax2.set_ylabel('PSNR (dB)', fontsize=12)
-    ax2.set_title('Hash Encoding vs Latent Texture: PSNR vs Training Steps\n'
-                  '(same SIREN decoder, matched parameter budget)',
+    title_sfx = ' + Decoder Activation Comparison' if include_v3 else ''
+    ax2.set_title(f'Hash vs Latent Variants: PSNR vs Training Steps{title_sfx}\n'
+                  '(hidden=64, depth=2)',
                   fontsize=12, fontweight='bold')
-    ax2.legend(fontsize=10, framealpha=0.92)
+    ax2.legend(fontsize=9.5, framealpha=0.92)
     ax2.grid(True, alpha=0.3)
     ax2.set_xlim(left=0)
     fig2.tight_layout()
@@ -516,17 +811,16 @@ def fig_latent_vs_hash(img_np):
     plt.close()
     print("Generated: images/fig_latent_vs_hash_curves.png")
 
-    # Collect PSNR summary dict for README
-    results = {
-        'hash':   {'params': h_params, 'ratio': h_ratio,
-                   **{f'psnr_{s}': h_snaps[s][1] for s in STEPS}},
-        'latent': {'params': l_params, 'ratio': l_ratio,
-                   **{f'psnr_{s}': l_snaps[s][1] for s in STEPS}},
-    }
-
-    # Also generate latent visualization using the final-step latent preview
+    # ── Latent visualization (uses single-scale as before) ────────────────────
     fig_latent_visualization(img_np, latent_np,
-                             l_snaps[STEPS[-1]][0], l_snaps[STEPS[-1]][2])
+                             s_snaps[STEPS[-1]][0], s_snaps[STEPS[-1]][2])
+
+    # ── Summary dict ──────────────────────────────────────────────────────────
+    results = {}
+    for row_label, snaps, _, params, ratio in rows:
+        key = row_label.lower().replace(' ', '_').replace('+', 'plus')
+        results[key] = {'params': params, 'ratio': ratio,
+                        **{f'psnr_{s}': snaps[s][1] for s in STEPS}}
     return results
 
 
@@ -582,14 +876,30 @@ def fig_latent_visualization(img_np, latent_np, recon_np, latent_preview_np):
 # ====================================================================
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--arch-only',   action='store_true')
-    parser.add_argument('--hash-only',   action='store_true')
-    parser.add_argument('--latent-only', action='store_true')
+    parser.add_argument('--arch-only',         action='store_true')
+    parser.add_argument('--latent-arch-only',  action='store_true',
+                        help='Generate tinyLatent architecture diagram only')
+    parser.add_argument('--hash-only',         action='store_true')
+    parser.add_argument('--latent-only',       action='store_true',
+                        help='Run original Hash+SingleScale latent comparison')
+    parser.add_argument('--latent-v2-only',    action='store_true',
+                        help='Run full 4-row comparison (Hash + Single + TwoScale + QAT)')
+    parser.add_argument('--decoder-act-only',  action='store_true',
+                        help='Run 7-row comparison adding GELU/SiLU decoder rows')
     args = parser.parse_args()
 
-    run_arch   = not (args.hash_only or args.latent_only)
-    run_hash   = not (args.arch_only or args.latent_only)
-    run_latent = not (args.arch_only or args.hash_only)
+    _any_specific = (args.hash_only or args.latent_only or args.latent_v2_only
+                     or args.latent_arch_only or args.decoder_act_only)
+    run_arch         = not _any_specific
+    run_latent_arch  = args.latent_arch_only or not (
+                            args.hash_only or args.latent_only or args.latent_v2_only
+                            or args.arch_only or args.decoder_act_only)
+    run_hash         = not (args.arch_only or args.latent_only or args.latent_v2_only
+                            or args.latent_arch_only or args.decoder_act_only)
+    run_latent       = not (args.arch_only or args.hash_only or args.latent_v2_only
+                            or args.latent_arch_only or args.decoder_act_only)
+    run_latent_v2    = args.latent_v2_only
+    run_decoder_act  = args.decoder_act_only
 
     # Load image — use lossless PNG for clean PSNR numbers
     img_path = local_dir / 'sample.png'
@@ -600,8 +910,12 @@ if __name__ == '__main__':
     print(f"Image: {img_path.name}  {img_np.shape[1]}×{img_np.shape[0]}")
 
     if run_arch:
-        print("\n=== Generating architecture diagram ===")
+        print("\n=== Generating Hash architecture diagram ===")
         fig_mlp_architecture()
+
+    if run_latent_arch:
+        print("\n=== Generating Latent architecture diagram ===")
+        fig_latent_architecture()
 
     hash_results = None
     if run_hash:
@@ -615,11 +929,31 @@ if __name__ == '__main__':
                   + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
 
     if run_latent:
-        print("\n=== Training Latent vs Hash comparison ===")
-        latent_results = fig_latent_vs_hash(img_np)
+        print("\n=== Training Latent vs Hash comparison (2-row) ===")
+        latent_results = fig_latent_vs_hash(img_np, include_v2=False)
         print("\n\n=== Latent vs Hash Summary ===")
         for method, r in latent_results.items():
-            print(f"{method:10s}  "
+            print(f"{method:40s}  "
+                  f"{r['params']:>8,} params  "
+                  f"{r['ratio']:5.1f}x  "
+                  + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
+
+    if run_latent_v2:
+        print("\n=== Training 4-row Latent vs Hash comparison (v2: +TwoScale +QAT) ===")
+        latent_v2_results = fig_latent_vs_hash(img_np, include_v2=True)
+        print("\n\n=== Latent v2 Summary ===")
+        for method, r in latent_v2_results.items():
+            print(f"{method:40s}  "
+                  f"{r['params']:>8,} params  "
+                  f"{r['ratio']:5.1f}x  "
+                  + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
+
+    if run_decoder_act:
+        print("\n=== Training 7-row comparison: SIREN vs GELU vs SiLU decoders ===")
+        act_results = fig_latent_vs_hash(img_np, include_v2=True, include_v3=True)
+        print("\n\n=== Decoder Activation Summary ===")
+        for method, r in act_results.items():
+            print(f"{method:40s}  "
                   f"{r['params']:>8,} params  "
                   f"{r['ratio']:5.1f}x  "
                   + "  ".join(f"@{s}: {r[f'psnr_{s}']:.1f}dB" for s in (500, 2000, 5000)))
